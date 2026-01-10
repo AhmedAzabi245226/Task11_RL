@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local outputs / artifacts
+models/
+*.zip
+*.gif
+
+# Editor / OS
+.vscode/
+.DS_Store
