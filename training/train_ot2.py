@@ -17,6 +17,11 @@ Remote run (final example):
     --total_timesteps 204800 ^
     --checkpoint_freq 10240 ^
     --n_steps 1024 --batch_size 128 --action_repeat 5
+
+Notes:
+- Models are saved under: Task11_RL/models/<run_name>/
+- If running with ClearML, checkpoints + final model are uploaded to: Task -> Artifacts
+- This script avoids ClearML recursion by checking CLEARML_TASK_ID (works across SDK versions)
 """
 
 import os
@@ -118,18 +123,25 @@ def maybe_init_clearml(args):
     """
     If --use_clearml is set, initialize a ClearML Task and hand execution to the remote worker.
 
-    IMPORTANT:
-    - When already running on a remote worker, DO NOT call execute_remotely again (prevents recursion/abort).
+    Compatibility note:
+    - Do NOT use Task.running_remotely() (not present in some ClearML versions).
+    - Instead, rely on the environment variable CLEARML_TASK_ID, which is set on the worker.
     """
     if not args.use_clearml:
         return None
 
     from clearml import Task
 
-    # If already running remotely, just attach to the current task
-    if Task.running_remotely():
-        return Task.current_task()
+    # If we are already running on a ClearML worker, CLEARML_TASK_ID will be set.
+    # In that case, do NOT call execute_remotely() again.
+    if os.environ.get("CLEARML_TASK_ID"):
+        # Attach to current task if possible; otherwise init (it will reuse on worker)
+        t = Task.current_task()
+        if t is None:
+            t = Task.init(project_name=args.project_name, task_name=args.task_name)
+        return t
 
+    # Local machine: create task and send to queue
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.set_base_docker(args.docker)
 
@@ -159,7 +171,7 @@ def upload_artifact(task, name: str, filepath: str):
 def main():
     args = parse_args()
 
-    # If enabled, enqueue to ClearML and run remotely
+    # If enabled, enqueue to ClearML and run remotely (local process exits after enqueue)
     task = maybe_init_clearml(args)
 
     # Auto-generate run folder name if missing
@@ -222,7 +234,7 @@ def main():
     print("Save dir:", model_root)
     print("====================================\n")
 
-    # Remote runs: avoid progress bar overhead
+    # On remote workers, progress bars can be slow/noisy
     use_progress_bar = not bool(args.use_clearml)
 
     # Train in chunks so we checkpoint + upload regularly
