@@ -5,14 +5,17 @@ PPO training for OT2GymEnv with optional ClearML remote execution.
 
 ClearML target (mentor requirement):
   Mentor Group - Alican / Group 1
-  => project_name = "Mentor Group - Alican/Group 1"
 
-Local run (no ClearML):
+Local run:
   python training/train_ot2.py --total_timesteps 50000 --checkpoint_freq 20480 --run_name ppo_local_50k
 
-Remote run (ClearML, GPU queue):
-  python training/train_ot2.py --use_clearml --queue gpu --total_timesteps 2048000 --checkpoint_freq 204800 --run_name ppo_group1_2m_ar5 --action_repeat 5
+Remote run (final):
+  python training/train_ot2.py --use_clearml --queue gpu \
+    --total_timesteps 2048000 --checkpoint_freq 204800 \
+    --task_name OT2_PPO_FINAL \
+    --run_name ppo_group1_final_2m_ar5
 """
+
 
 import os
 import sys
