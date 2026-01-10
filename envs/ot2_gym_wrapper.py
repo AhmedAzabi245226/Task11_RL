@@ -7,23 +7,27 @@ digital twin (Task 9 sim_class.py).
 Key design:
 - Action: pipette velocity commands [vx, vy, vz, drop] (drop unused)
 - Observation: pipette position, target position, and error vector
-- Reward: progress-based shaping + distance shaping + success bonus
+- Reward: progress shaping + distance shaping + success bonus
           + small action penalty + boundary penalty
-- Termination: success when error < success_threshold, truncation at max_steps
+- Termination: success when error < success_threshold
+- Truncation: max_steps
 
-This wrapper is compatible with Stable Baselines 3.
+Compatible with Stable Baselines 3.
 """
+
+from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
 # -------------------------------------------------
-# Task 9 path setup (portable: Task 9 is inside Task11_RL)
+# Task 9 path setup (portable: Task 9 is inside this repo)
 # -------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # .../Task11_RL
 TASK9_PATH = (PROJECT_ROOT / "task09_robotics_environment").resolve()
@@ -40,9 +44,9 @@ if not TASK9_PATH.exists():
 
 # Make Task 9 importable (for sim_class.py)
 if str(TASK9_PATH) not in sys.path:
-    sys.path.append(str(TASK9_PATH))
+    sys.path.insert(0, str(TASK9_PATH))
 
-from sim_class import Simulation
+from sim_class import Simulation  # noqa: E402
 
 
 class OT2GymEnv(gym.Env):
@@ -54,10 +58,10 @@ class OT2GymEnv(gym.Env):
         self,
         render: bool = False,
         max_steps: int = 200,
-        seed=None,
+        seed: Optional[int] = None,
         success_threshold: float = 0.01,
         debug: bool = False,
-        action_repeat: int = 1,   # optional: repeat each action N sim steps
+        action_repeat: int = 1,
     ):
         super().__init__()
 
@@ -101,18 +105,26 @@ class OT2GymEnv(gym.Env):
         self.target = np.zeros(3, dtype=np.float32)
 
         # For progress reward shaping
-        self.prev_distance = None
+        self.prev_distance: Optional[float] = None
 
         if self.debug:
-            print("ENV INIT success_threshold =", self.success_threshold)
+            print(
+                "ENV INIT:",
+                "success_threshold=", self.success_threshold,
+                "max_steps=", self.max_steps,
+                "action_repeat=", self.action_repeat,
+            )
 
-    def _set_cwd_for_assets(self):
-        """Ensure CWD is Task 9 folder so relative assets (textures, URDF, etc.) resolve correctly."""
+    # ---------------------------
+    # Helpers
+    # ---------------------------
+    def _set_cwd_for_assets(self) -> None:
+        """Ensure CWD is Task 9 folder so relative assets resolve correctly."""
         if not self._cwd_set:
             os.chdir(str(TASK9_PATH))
             self._cwd_set = True
 
-    def _sample_target(self):
+    def _sample_target(self) -> np.ndarray:
         """Sample a random reachable target within a safe subset of the workspace."""
         x = self.rng.uniform(self.X_MIN + self.margin, self.X_MAX - self.margin)
         y = self.rng.uniform(self.Y_MIN + self.margin, self.Y_MAX - self.margin)
@@ -125,34 +137,58 @@ class OT2GymEnv(gym.Env):
 
         return np.array([x, y, z], dtype=np.float32)
 
-    def reset(self, seed=None, options=None):
+    def _get_pipette(self) -> np.ndarray:
+        """Read pipette XYZ from sim."""
+        states = self.sim.get_states()
+        robot_state = next(iter(states.values()))
+        return np.array(robot_state["pipette_position"], dtype=np.float32)
+
+    def _get_obs(self) -> np.ndarray:
+        pipette = self._get_pipette()
+        error = self.target - pipette
+        return np.concatenate([pipette, self.target, error]).astype(np.float32)
+
+    # ---------------------------
+    # Gymnasium API
+    # ---------------------------
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
         super().reset(seed=seed)
 
-        # Ensure assets still resolve even if caller changed cwd
         self._set_cwd_for_assets()
 
-        # Gymnasium seeding convention
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
         self.sim.reset(num_agents=1)
         self.step_count = 0
 
-        # New random target each episode
-        self.target = self._sample_target()
+        # New random target each episode (unless caller passes options["target"])
+        if options and "target" in options and options["target"] is not None:
+            self.target = np.array(options["target"], dtype=np.float32)
+        else:
+            self.target = self._sample_target()
 
-        # Compute obs ONCE, then derive prev_distance from it
         obs = self._get_obs()
         pipette = obs[0:3]
         self.prev_distance = float(np.linalg.norm(self.target - pipette))
 
-        info = {"target": self.target.copy()}
+        info = {
+            "target": self.target.copy(),
+            "pipette": pipette.copy(),
+            "distance": float(self.prev_distance),
+            "is_success": False,
+        }
         return obs, info
 
-    def step(self, action):
-        # Ensure assets still resolve even if caller changed cwd
+    def step(
+        self,
+        action: np.ndarray,
+    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         self._set_cwd_for_assets()
-
         self.step_count += 1
 
         action = np.array(action, dtype=np.float32)
@@ -171,8 +207,8 @@ class OT2GymEnv(gym.Env):
         # Reward shaping
         # -------------------------
         # Progress reward: positive when moving closer
-        progress = float(self.prev_distance - distance) if self.prev_distance is not None else 0.0
-        reward = 10.0 * progress
+        progress = (self.prev_distance - distance) if self.prev_distance is not None else 0.0
+        reward = 10.0 * float(progress)
 
         # Dense distance shaping
         reward -= 0.2 * distance
@@ -180,38 +216,23 @@ class OT2GymEnv(gym.Env):
         # Small action penalty
         reward -= 0.01 * float(np.linalg.norm(action[0:3]))
 
-        # Boundary penalty: discourage saturating at workspace edges/corners
+        # Boundary penalty: discourage saturating near workspace edges/corners
         x, y, z = float(pipette[0]), float(pipette[1]), float(pipette[2])
         edge_margin = 0.01  # 1 cm band near edges
         edge_pen = 0.0
-
         if x < self.X_MIN + edge_margin or x > self.X_MAX - edge_margin:
             edge_pen += 1.0
         if y < self.Y_MIN + edge_margin or y > self.Y_MAX - edge_margin:
             edge_pen += 1.0
         if z < self.Z_MIN + edge_margin or z > self.Z_MAX - edge_margin:
             edge_pen += 1.0
-
         reward -= 0.5 * edge_pen
 
-        # Update for next step
         self.prev_distance = distance
 
         success = distance < self.success_threshold
-
-        # Success bonus
         if success:
             reward += 10.0
-
-        if self.debug and (self.step_count % 50 == 0 or success):
-            print(
-                "DEBUG step", self.step_count,
-                "distance", distance,
-                "threshold", self.success_threshold,
-                "success", success,
-                "reward", reward,
-                "edge_pen", edge_pen
-            )
 
         terminated = success
         truncated = self.step_count >= self.max_steps
@@ -221,28 +242,29 @@ class OT2GymEnv(gym.Env):
             "pipette": pipette.copy(),
             "distance": distance,
             "is_success": success,
+            "edge_pen": edge_pen,
+            "action_repeat": self.action_repeat,
         }
 
-        return obs, reward, terminated, truncated, info
+        if self.debug and (self.step_count % 50 == 0 or success):
+            print(
+                "DEBUG step", self.step_count,
+                "distance", distance,
+                "success", success,
+                "reward", reward,
+                "edge_pen", edge_pen,
+            )
 
-    def _get_obs(self):
-        states = self.sim.get_states()
-        robot_state = next(iter(states.values()))
-
-        pipette = np.array(robot_state["pipette_position"], dtype=np.float32)
-        error = self.target - pipette
-
-        obs = np.concatenate([pipette, self.target, error]).astype(np.float32)
-        return obs
+        return obs, float(reward), terminated, truncated, info
 
     def render(self):
+        # Rendering handled by PyBullet in sim_class; nothing to return for Gymnasium here.
         return None
 
     def close(self):
         try:
             self.sim.close()
         finally:
-            # Restore original working directory even if sim.close() errors
             if self._old_cwd is not None:
                 os.chdir(self._old_cwd)
             self._cwd_set = False
