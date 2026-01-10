@@ -9,8 +9,8 @@ ClearML target (mentor requirement):
 Local run:
   python training/train_ot2.py --total_timesteps 50000 --checkpoint_freq 20480 --run_name ppo_local_50k
 
-Remote run (final example):
-  python training/train_ot2.py --use_clearml --queue default ^
+Remote run (final example, Windows cmd):
+  python training\\train_ot2.py --use_clearml --queue default ^
     --project_name "Mentor Group - Alican/Group 1" ^
     --task_name "OT2_FINAL_RUN" ^
     --run_name ot2_final ^
@@ -30,6 +30,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import shutil
+from typing import Optional
 
 # -------------------------------------------------
 # Ensure project root is on sys.path so "envs" imports work
@@ -40,6 +41,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 from envs.ot2_gym_wrapper import OT2GymEnv
 
 
@@ -119,46 +121,49 @@ def parse_args():
     return p.parse_args()
 
 
-def maybe_init_clearml(args):
-    """
-    If --use_clearml is set, initialize a ClearML Task and hand execution to the remote worker.
-
-    Compatibility note:
-    - Do NOT use Task.running_remotely() (not present in some ClearML versions).
-    - Instead, rely on the environment variable CLEARML_TASK_ID, which is set on the worker.
-    """
-    if not args.use_clearml:
-        return None
-
-    from clearml import Task
-
-    # If we are already running on a ClearML worker, CLEARML_TASK_ID will be set.
-    # In that case, do NOT call execute_remotely() again.
-    if os.environ.get("CLEARML_TASK_ID"):
-        # Attach to current task if possible; otherwise init (it will reuse on worker)
-        t = Task.current_task()
-        if t is None:
-            t = Task.init(project_name=args.project_name, task_name=args.task_name)
-        return t
-
-    # Local machine: create task and send to queue
-    task = Task.init(project_name=args.project_name, task_name=args.task_name)
-    task.set_base_docker(args.docker)
-
-    # Enqueue to agent; local process terminates after this call
-    task.execute_remotely(queue_name=args.queue)
-    return task
-
-
 def round_up_to_multiple(x: int, m: int) -> int:
     x = int(x)
     m = int(m)
     return int(((x + m - 1) // m) * m)
 
 
-def upload_artifact(task, name: str, filepath: str):
-    """Upload a file to ClearML Artifacts if task exists. Never crashes training."""
+def maybe_init_clearml(args):
+    """
+    If --use_clearml is set, initialize a ClearML Task and hand execution to the remote worker.
+
+    Compatibility note:
+    - Do NOT use Task.running_remotely() (missing in some versions).
+    - Instead rely on CLEARML_TASK_ID which is set on remote workers.
+    """
+    if not args.use_clearml:
+        return None
+
+    from clearml import Task
+
+    # Already on worker -> do NOT enqueue again
+    if os.environ.get("CLEARML_TASK_ID"):
+        t = Task.current_task()
+        if t is None:
+            # fallback: will attach/reuse on worker side
+            t = Task.init(project_name=args.project_name, task_name=args.task_name)
+        return t
+
+    # Local machine: create task and send to queue
+    task = Task.init(project_name=args.project_name, task_name=args.task_name)
+    task.set_base_docker(args.docker)
+    task.execute_remotely(queue_name=args.queue)
+    return task  # local process exits after execute_remotely()
+
+
+def upload_artifact(name: str, filepath: str):
+    """
+    Reliable artifact upload:
+    - Always fetch Task.current_task() at upload time (works on worker)
+    - Never crash training if upload fails
+    """
     try:
+        from clearml import Task
+        task = Task.current_task()
         if task is None:
             return
         if not filepath or not os.path.exists(filepath):
@@ -168,11 +173,77 @@ def upload_artifact(task, name: str, filepath: str):
         return
 
 
+class ClearMLScalarCallback(BaseCallback):
+    """
+    Reports a few useful Scalars to ClearML so the UI is not empty:
+    - success_rate from env info ("is_success")
+    - ep_rew_mean based on per-episode returns
+    """
+
+    def __init__(self, report_every_steps: int = 2048):
+        super().__init__()
+        self.report_every_steps = int(report_every_steps)
+        self._task = None
+        self._logger = None
+
+        # Episode tracking
+        self._ep_return = 0.0
+        self._ep_len = 0
+        self._ep_returns = []
+        self._successes = 0
+        self._episodes = 0
+
+    def _on_training_start(self) -> None:
+        try:
+            from clearml import Task
+            self._task = Task.current_task()
+            self._logger = self._task.get_logger() if self._task else None
+        except Exception:
+            self._task = None
+            self._logger = None
+
+    def _on_step(self) -> bool:
+        # rewards is a vector for VecEnv; use first env
+        reward = float(self.locals["rewards"][0])
+        self._ep_return += reward
+        self._ep_len += 1
+
+        dones = self.locals["dones"]
+        infos = self.locals["infos"]
+
+        if bool(dones[0]):
+            self._episodes += 1
+            self._ep_returns.append(self._ep_return)
+
+            # success flag from wrapper info
+            is_success = bool(infos[0].get("is_success", False))
+            if is_success:
+                self._successes += 1
+
+            # reset episode counters
+            self._ep_return = 0.0
+            self._ep_len = 0
+
+        if self._logger and (self.num_timesteps % self.report_every_steps == 0):
+            # compute rolling stats (last 50 eps)
+            window = 50
+            recent = self._ep_returns[-window:] if self._ep_returns else []
+            ep_rew_mean = sum(recent) / len(recent) if recent else 0.0
+            success_rate = (self._successes / self._episodes) if self._episodes > 0 else 0.0
+
+            it = int(self.num_timesteps)
+            self._logger.report_scalar("rollout", "ep_rew_mean_est", ep_rew_mean, iteration=it)
+            self._logger.report_scalar("rollout", "success_rate_est", success_rate, iteration=it)
+            self._logger.report_scalar("time", "timesteps", it, iteration=it)
+
+        return True
+
+
 def main():
     args = parse_args()
 
     # If enabled, enqueue to ClearML and run remotely (local process exits after enqueue)
-    task = maybe_init_clearml(args)
+    _ = maybe_init_clearml(args)
 
     # Auto-generate run folder name if missing
     if not args.run_name:
@@ -237,6 +308,8 @@ def main():
     # On remote workers, progress bars can be slow/noisy
     use_progress_bar = not bool(args.use_clearml)
 
+    cb = ClearMLScalarCallback(report_every_steps=args.n_steps)
+
     # Train in chunks so we checkpoint + upload regularly
     while trained < total:
         this_chunk = min(chunk, total - trained)
@@ -245,6 +318,7 @@ def main():
             total_timesteps=this_chunk,
             progress_bar=use_progress_bar,
             reset_num_timesteps=False,
+            callback=cb,
         )
 
         trained += this_chunk
@@ -253,19 +327,19 @@ def main():
         print("Saving checkpoint to:", ckpt_base)
         model.save(ckpt_base)  # writes ckpt_base + ".zip"
 
-        upload_artifact(task, name=f"ppo_checkpoint_{trained}_steps", filepath=f"{ckpt_base}.zip")
+        upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=f"{ckpt_base}.zip")
 
     # Save final model
     final_base = os.path.join(model_root, "ppo_ot2_final")
     print("Saving final model to:", final_base)
     model.save(final_base)
-    upload_artifact(task, name="ppo_final_model", filepath=f"{final_base}.zip")
+    upload_artifact(name="ppo_final_model", filepath=f"{final_base}.zip")
 
     # Zip the entire run folder and upload once (easy download)
     try:
         zip_base = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
         zip_file = shutil.make_archive(base_name=zip_base, format="zip", root_dir=model_root)
-        upload_artifact(task, name="run_folder_zip", filepath=zip_file)
+        upload_artifact(name="run_folder_zip", filepath=zip_file)
     except Exception:
         pass
 
