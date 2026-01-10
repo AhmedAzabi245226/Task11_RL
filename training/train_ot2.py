@@ -9,13 +9,15 @@ ClearML target (mentor requirement):
 Local run:
   python training/train_ot2.py --total_timesteps 50000 --checkpoint_freq 20480 --run_name ppo_local_50k
 
-Remote run (final):
-  python training/train_ot2.py --use_clearml --queue gpu \
-    --total_timesteps 2048000 --checkpoint_freq 204800 \
-    --task_name OT2_PPO_FINAL \
-    --run_name ppo_group1_final_2m_ar5
+Remote run (final example):
+  python training/train_ot2.py --use_clearml --queue default ^
+    --project_name "Mentor Group - Alican/Group 1" ^
+    --task_name "OT2_FINAL_RUN" ^
+    --run_name ot2_final ^
+    --total_timesteps 204800 ^
+    --checkpoint_freq 10240 ^
+    --n_steps 1024 --batch_size 128 --action_repeat 5
 """
-
 
 import os
 import sys
@@ -24,12 +26,11 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 
-
 # -------------------------------------------------
 # Ensure project root is on sys.path so "envs" imports work
 # -------------------------------------------------
-THIS_DIR = Path(__file__).resolve().parent               # .../Task11_RL/training
-PROJECT_ROOT = THIS_DIR.parent                           # .../Task11_RL
+THIS_DIR = Path(__file__).resolve().parent          # .../Task11_RL/training
+PROJECT_ROOT = THIS_DIR.parent                      # .../Task11_RL
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -51,7 +52,12 @@ def parse_args():
         help="ClearML project path (Parent/Subproject)",
     )
     p.add_argument("--task_name", type=str, default="OT2_PPO_Train", help="ClearML task name")
-    p.add_argument("--queue", type=str, default="gpu", help="ClearML queue name (gpu or default)")
+    p.add_argument(
+        "--queue",
+        type=str,
+        default="default",
+        help='ClearML queue name. Use "default" unless you know the exact GPU queue name.',
+    )
     p.add_argument("--docker", type=str, default="deanis/2023y2b-rl:latest", help="ClearML base docker image")
 
     # ----------------------------
@@ -95,13 +101,13 @@ def parse_args():
     p.add_argument(
         "--total_timesteps",
         type=int,
-        default=2_048_000,
+        default=204_800,
         help="Total training timesteps (rounded up to a multiple of n_steps).",
     )
     p.add_argument(
         "--checkpoint_freq",
         type=int,
-        default=204_800,
+        default=10_240,
         help="Save every N timesteps (rounded up to a multiple of n_steps).",
     )
 
@@ -110,18 +116,24 @@ def parse_args():
 
 def maybe_init_clearml(args):
     """
-    If --use_clearml is set, initialize a ClearML Task and hand execution
-    to the remote worker. Locally, the script will exit after execute_remotely().
+    If --use_clearml is set, initialize a ClearML Task and hand execution to the remote worker.
+
+    IMPORTANT:
+    - When already running on a remote worker, DO NOT call execute_remotely again (prevents recursion/abort).
     """
     if not args.use_clearml:
         return None
 
     from clearml import Task
 
+    # If already running remotely, just attach to the current task
+    if Task.running_remotely():
+        return Task.current_task()
+
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.set_base_docker(args.docker)
 
-    # This stops local execution and continues on the remote worker
+    # Enqueue to agent; local process terminates after this call
     task.execute_remotely(queue_name=args.queue)
     return task
 
@@ -133,14 +145,11 @@ def round_up_to_multiple(x: int, m: int) -> int:
 
 
 def upload_artifact(task, name: str, filepath: str):
-    """
-    Upload a file to ClearML Artifacts if we are running under ClearML.
-    Never crashes training.
-    """
+    """Upload a file to ClearML Artifacts if task exists. Never crashes training."""
     try:
         if task is None:
             return
-        if not os.path.exists(filepath):
+        if not filepath or not os.path.exists(filepath):
             return
         task.upload_artifact(name=name, artifact_object=filepath)
     except Exception:
@@ -150,7 +159,7 @@ def upload_artifact(task, name: str, filepath: str):
 def main():
     args = parse_args()
 
-    # If enabled, this enqueues to ClearML and runs remotely
+    # If enabled, enqueue to ClearML and run remotely
     task = maybe_init_clearml(args)
 
     # Auto-generate run folder name if missing
@@ -206,53 +215,45 @@ def main():
     print("Total timesteps:", total)
     print("Checkpoint freq:", chunk)
     print("PPO n_steps:", args.n_steps)
+    print("Batch size:", args.batch_size)
     print("Env max_steps:", args.max_steps)
     print("Env success_threshold:", args.success_threshold)
     print("Env action_repeat:", args.action_repeat)
     print("Save dir:", model_root)
     print("====================================\n")
 
-    # Train in chunks so we can checkpoint often
+    # Remote runs: avoid progress bar overhead
+    use_progress_bar = not bool(args.use_clearml)
+
+    # Train in chunks so we checkpoint + upload regularly
     while trained < total:
         this_chunk = min(chunk, total - trained)
 
         model.learn(
             total_timesteps=this_chunk,
-            progress_bar=True,
+            progress_bar=use_progress_bar,
             reset_num_timesteps=False,
         )
 
         trained += this_chunk
 
-        # Save checkpoint locally on the worker
-        ckpt_path = os.path.join(model_root, f"ppo_ot2_{trained}_steps")
-        print("Saving checkpoint to:", ckpt_path)
-        model.save(ckpt_path)  # writes ckpt_path + ".zip"
+        ckpt_base = os.path.join(model_root, f"ppo_ot2_{trained}_steps")
+        print("Saving checkpoint to:", ckpt_base)
+        model.save(ckpt_base)  # writes ckpt_base + ".zip"
 
-        # Upload checkpoint to ClearML so you can download to your laptop
-        upload_artifact(
-            task=task,
-            name=f"ppo_checkpoint_{trained}_steps",
-            filepath=f"{ckpt_path}.zip",
-        )
+        upload_artifact(task, name=f"ppo_checkpoint_{trained}_steps", filepath=f"{ckpt_base}.zip")
 
     # Save final model
-    final_path = os.path.join(model_root, "ppo_ot2_final")
-    print("Saving final model to:", final_path)
-    model.save(final_path)
+    final_base = os.path.join(model_root, "ppo_ot2_final")
+    print("Saving final model to:", final_base)
+    model.save(final_base)
+    upload_artifact(task, name="ppo_final_model", filepath=f"{final_base}.zip")
 
-    # Upload final model
-    upload_artifact(
-        task=task,
-        name="ppo_final_model",
-        filepath=f"{final_path}.zip",
-    )
-
-    # Optional: zip the entire run folder and upload once (very convenient)
+    # Zip the entire run folder and upload once (easy download)
     try:
         zip_base = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
         zip_file = shutil.make_archive(base_name=zip_base, format="zip", root_dir=model_root)
-        upload_artifact(task=task, name="run_folder_zip", filepath=zip_file)
+        upload_artifact(task, name="run_folder_zip", filepath=zip_file)
     except Exception:
         pass
 
@@ -260,7 +261,7 @@ def main():
 
     print("\nTraining finished successfully.")
     print("All checkpoints saved under:", model_root)
-    print("If running in ClearML, download models from: Task -> Artifacts")
+    print("If running in ClearML, download from: Task -> Artifacts")
 
 
 if __name__ == "__main__":
