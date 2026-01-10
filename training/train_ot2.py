@@ -18,14 +18,16 @@ import os
 import sys
 import argparse
 from datetime import datetime
+from pathlib import Path
+
 
 # -------------------------------------------------
 # Ensure project root is on sys.path so "envs" imports work
 # -------------------------------------------------
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))        # .../Task11_RL/training
-PROJECT_ROOT = os.path.dirname(THIS_DIR)                     # .../Task11_RL
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+THIS_DIR = Path(__file__).resolve().parent               # .../Task11_RL/training
+PROJECT_ROOT = THIS_DIR.parent                           # .../Task11_RL
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from stable_baselines3 import PPO
 from envs.ot2_gym_wrapper import OT2GymEnv
@@ -68,7 +70,7 @@ def parse_args():
         "--action_repeat",
         type=int,
         default=5,
-        help="Repeat each action N sim steps. 3-5 usually improves learning speed.",
+        help="Repeat each action N sim steps. 3-5 often improves learning speed.",
     )
     p.add_argument("--render", action="store_true", help="Enable rendering (NOT recommended on server)")
 
@@ -86,8 +88,18 @@ def parse_args():
     # ----------------------------
     # Timesteps + checkpointing
     # ----------------------------
-    p.add_argument("--total_timesteps", type=int, default=2_048_000, help="Default longer training run (multiple of n_steps)")
-    p.add_argument("--checkpoint_freq", type=int, default=204_800, help="Save every N timesteps (multiple of n_steps)")
+    p.add_argument(
+        "--total_timesteps",
+        type=int,
+        default=2_048_000,
+        help="Total training timesteps (will be rounded up to a multiple of n_steps).",
+    )
+    p.add_argument(
+        "--checkpoint_freq",
+        type=int,
+        default=204_800,
+        help="Save every N timesteps (rounded up to a multiple of n_steps).",
+    )
 
     return p.parse_args()
 
@@ -104,12 +116,35 @@ def maybe_init_clearml(args):
 
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.set_base_docker(args.docker)
+
+    # Important: this line causes the local process to stop and the remote one to continue
     task.execute_remotely(queue_name=args.queue)
+
     return task
 
 
-def _round_up_to_multiple(x: int, m: int) -> int:
-    return int(((int(x) + m - 1) // m) * m)
+def round_up_to_multiple(x: int, m: int) -> int:
+    x = int(x)
+    m = int(m)
+    return int(((x + m - 1) // m) * m)
+
+
+def upload_artifact_if_possible(name: str, filepath: str):
+    """
+    Upload file to ClearML Artifacts IF running under ClearML.
+    Safe to call even for local runs.
+    """
+    try:
+        from clearml import Task
+        task = Task.current_task()
+        if task is None:
+            return
+        if not os.path.exists(filepath):
+            return
+        task.upload_artifact(name=name, artifact_object=filepath)
+    except Exception:
+        # Do not crash training because of artifact upload issues
+        return
 
 
 def main():
@@ -123,16 +158,13 @@ def main():
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.run_name = f"ppo_ot2_{stamp}"
 
-    # -------------------------------------------------
     # Align timesteps to PPO rollout size (n_steps)
-    # PPO collects rollouts of n_steps; totals should be multiples of n_steps
-    # -------------------------------------------------
     rollout = int(args.n_steps)
-    args.total_timesteps = _round_up_to_multiple(args.total_timesteps, rollout)
-    args.checkpoint_freq = _round_up_to_multiple(args.checkpoint_freq, rollout)
+    args.total_timesteps = round_up_to_multiple(args.total_timesteps, rollout)
+    args.checkpoint_freq = round_up_to_multiple(args.checkpoint_freq, rollout)
 
     # Model save folder
-    model_root = os.path.join(PROJECT_ROOT, "models", args.run_name)
+    model_root = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
     os.makedirs(model_root, exist_ok=True)
 
     # Environment (render=False by default for server safety)
@@ -164,6 +196,7 @@ def main():
         chunk = total
 
     trained = 0
+
     print("\n========== TRAINING CONFIG ==========")
     print("ClearML enabled:", bool(args.use_clearml))
     print("ClearML project:", args.project_name)
@@ -176,8 +209,10 @@ def main():
     print("Env max_steps:", args.max_steps)
     print("Env success_threshold:", args.success_threshold)
     print("Env action_repeat:", args.action_repeat)
+    print("Save dir:", model_root)
     print("====================================\n")
 
+    # Train in chunks so we can checkpoint often
     while trained < total:
         this_chunk = min(chunk, total - trained)
 
@@ -186,15 +221,36 @@ def main():
             progress_bar=True,
             reset_num_timesteps=False,
         )
+
         trained += this_chunk
 
+        # Save checkpoint locally on the worker
         ckpt_path = os.path.join(model_root, f"ppo_ot2_{trained}_steps")
         print("Saving checkpoint to:", ckpt_path)
-        model.save(ckpt_path)
+        model.save(ckpt_path)  # writes ckpt_path + ".zip"
+
+        # Upload checkpoint to ClearML so you can download to your laptop
+        upload_artifact_if_possible(
+            name=f"ppo_checkpoint_{trained}_steps",
+            filepath=f"{ckpt_path}.zip",
+        )
+
+    # Save final model
+    final_path = os.path.join(model_root, "ppo_ot2_final")
+    print("Saving final model to:", final_path)
+    model.save(final_path)
+
+    # Upload final model
+    upload_artifact_if_possible(
+        name="ppo_final_model",
+        filepath=f"{final_path}.zip",
+    )
 
     env.close()
+
     print("\nTraining finished successfully.")
     print("All checkpoints saved under:", model_root)
+    print("If running in ClearML, download models from: Task -> Artifacts")
 
 
 if __name__ == "__main__":
