@@ -19,6 +19,7 @@ import sys
 import argparse
 from datetime import datetime
 from pathlib import Path
+import shutil
 
 
 # -------------------------------------------------
@@ -92,7 +93,7 @@ def parse_args():
         "--total_timesteps",
         type=int,
         default=2_048_000,
-        help="Total training timesteps (will be rounded up to a multiple of n_steps).",
+        help="Total training timesteps (rounded up to a multiple of n_steps).",
     )
     p.add_argument(
         "--checkpoint_freq",
@@ -117,9 +118,8 @@ def maybe_init_clearml(args):
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.set_base_docker(args.docker)
 
-    # Important: this line causes the local process to stop and the remote one to continue
+    # This stops local execution and continues on the remote worker
     task.execute_remotely(queue_name=args.queue)
-
     return task
 
 
@@ -129,21 +129,18 @@ def round_up_to_multiple(x: int, m: int) -> int:
     return int(((x + m - 1) // m) * m)
 
 
-def upload_artifact_if_possible(name: str, filepath: str):
+def upload_artifact(task, name: str, filepath: str):
     """
-    Upload file to ClearML Artifacts IF running under ClearML.
-    Safe to call even for local runs.
+    Upload a file to ClearML Artifacts if we are running under ClearML.
+    Never crashes training.
     """
     try:
-        from clearml import Task
-        task = Task.current_task()
         if task is None:
             return
         if not os.path.exists(filepath):
             return
         task.upload_artifact(name=name, artifact_object=filepath)
     except Exception:
-        # Do not crash training because of artifact upload issues
         return
 
 
@@ -151,7 +148,7 @@ def main():
     args = parse_args()
 
     # If enabled, this enqueues to ClearML and runs remotely
-    _ = maybe_init_clearml(args)
+    task = maybe_init_clearml(args)
 
     # Auto-generate run folder name if missing
     if not args.run_name:
@@ -167,7 +164,7 @@ def main():
     model_root = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
     os.makedirs(model_root, exist_ok=True)
 
-    # Environment (render=False by default for server safety)
+    # Environment
     env = OT2GymEnv(
         render=args.render,
         max_steps=args.max_steps,
@@ -230,7 +227,8 @@ def main():
         model.save(ckpt_path)  # writes ckpt_path + ".zip"
 
         # Upload checkpoint to ClearML so you can download to your laptop
-        upload_artifact_if_possible(
+        upload_artifact(
+            task=task,
             name=f"ppo_checkpoint_{trained}_steps",
             filepath=f"{ckpt_path}.zip",
         )
@@ -241,10 +239,19 @@ def main():
     model.save(final_path)
 
     # Upload final model
-    upload_artifact_if_possible(
+    upload_artifact(
+        task=task,
         name="ppo_final_model",
         filepath=f"{final_path}.zip",
     )
+
+    # Optional: zip the entire run folder and upload once (very convenient)
+    try:
+        zip_base = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
+        zip_file = shutil.make_archive(base_name=zip_base, format="zip", root_dir=model_root)
+        upload_artifact(task=task, name="run_folder_zip", filepath=zip_file)
+    except Exception:
+        pass
 
     env.close()
 
