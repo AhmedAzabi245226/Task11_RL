@@ -1,36 +1,30 @@
 """
 train_ot2.py (Task 11)
 
-PPO training for OT2GymEnv with optional ClearML remote execution.
+PPO training for OT2GymEnv with ClearML remote execution support.
 
-ClearML target (mentor requirement):
-  Mentor Group - Alican / Group 1
+Key fixes:
+- Explicitly connects CLI args to ClearML (task.connect) so remote runs do not silently use defaults.
+- Prints sys.argv + resolved config in remote log for verification.
+- Artifact upload prints diagnostics (no silent failures).
+- Uploads checkpoints + final model + a zip of the entire run folder.
 
-Local run:
-  python training/train_ot2.py --total_timesteps 50000 --checkpoint_freq 20480 --run_name ppo_local_50k
-
-Remote run (final example, Windows cmd):
+Remote run (Windows cmd):
   python training\\train_ot2.py --use_clearml --queue default ^
     --project_name "Mentor Group - Alican/Group 1" ^
-    --task_name "OT2_FINAL_RUN" ^
-    --run_name ot2_final ^
-    --total_timesteps 204800 ^
-    --checkpoint_freq 10240 ^
+    --task_name "OT2_FINAL_RUN_2M" ^
+    --run_name ot2_final_2m ^
+    --total_timesteps 2000000 ^
+    --checkpoint_freq 102400 ^
     --n_steps 1024 --batch_size 128 --action_repeat 5
-
-Notes:
-- Models are saved under: Task11_RL/models/<run_name>/
-- If running with ClearML, checkpoints + final model are uploaded to: Task -> Artifacts
-- This script avoids ClearML recursion by checking CLEARML_TASK_ID (works across SDK versions)
 """
 
 import os
 import sys
 import argparse
+import shutil
 from datetime import datetime
 from pathlib import Path
-import shutil
-from typing import Optional
 
 # -------------------------------------------------
 # Ensure project root is on sys.path so "envs" imports work
@@ -52,20 +46,10 @@ def parse_args():
     # ClearML (remote execution)
     # ----------------------------
     p.add_argument("--use_clearml", action="store_true", help="Run training remotely via ClearML")
-    p.add_argument(
-        "--project_name",
-        type=str,
-        default="Mentor Group - Alican/Group 1",
-        help="ClearML project path (Parent/Subproject)",
-    )
-    p.add_argument("--task_name", type=str, default="OT2_PPO_Train", help="ClearML task name")
-    p.add_argument(
-        "--queue",
-        type=str,
-        default="default",
-        help='ClearML queue name. Use "default" unless you know the exact GPU queue name.',
-    )
-    p.add_argument("--docker", type=str, default="deanis/2023y2b-rl:latest", help="ClearML base docker image")
+    p.add_argument("--project_name", type=str, default="Mentor Group - Alican/Group 1")
+    p.add_argument("--task_name", type=str, default="OT2_PPO_Train")
+    p.add_argument("--queue", type=str, default="default")
+    p.add_argument("--docker", type=str, default="deanis/2023y2b-rl:latest")
 
     # ----------------------------
     # Run bookkeeping
@@ -83,13 +67,8 @@ def parse_args():
         default=0.03,
         help="Start easier (cm-level). Tighten later for mm-level accuracy.",
     )
-    p.add_argument(
-        "--action_repeat",
-        type=int,
-        default=5,
-        help="Repeat each action N sim steps. 3-5 often improves learning speed.",
-    )
-    p.add_argument("--render", action="store_true", help="Enable rendering (NOT recommended on server)")
+    p.add_argument("--action_repeat", type=int, default=5)
+    p.add_argument("--render", action="store_true", help="Enable rendering (not recommended on server)")
 
     # ----------------------------
     # PPO hyperparameters
@@ -105,18 +84,8 @@ def parse_args():
     # ----------------------------
     # Timesteps + checkpointing
     # ----------------------------
-    p.add_argument(
-        "--total_timesteps",
-        type=int,
-        default=204_800,
-        help="Total training timesteps (rounded up to a multiple of n_steps).",
-    )
-    p.add_argument(
-        "--checkpoint_freq",
-        type=int,
-        default=10_240,
-        help="Save every N timesteps (rounded up to a multiple of n_steps).",
-    )
+    p.add_argument("--total_timesteps", type=int, default=204_800)
+    p.add_argument("--checkpoint_freq", type=int, default=10_240)
 
     return p.parse_args()
 
@@ -127,68 +96,70 @@ def round_up_to_multiple(x: int, m: int) -> int:
     return int(((x + m - 1) // m) * m)
 
 
+def upload_artifact(name: str, filepath: str):
+    """Upload an artifact to ClearML with visible diagnostics."""
+    try:
+        from clearml import Task
+        task = Task.current_task()
+        if task is None:
+            print(f"[upload_artifact] No current ClearML task. Skipping {name}.")
+            return
+
+        if not filepath:
+            print(f"[upload_artifact] Empty filepath for {name}.")
+            return
+
+        if not os.path.exists(filepath):
+            print(f"[upload_artifact] File not found for {name}: {filepath}")
+            return
+
+        size_mb = os.path.getsize(filepath) / (1024 * 1024)
+        print(f"[upload_artifact] Uploading {name}: {filepath} ({size_mb:.2f} MB)")
+        task.upload_artifact(name=name, artifact_object=filepath)
+
+    except Exception as e:
+        print(f"[upload_artifact] FAILED {name}: {e}")
+
+
 def maybe_init_clearml(args):
     """
-    If --use_clearml is set, initialize a ClearML Task and hand execution to the remote worker.
-
-    Compatibility note:
-    - Do NOT use Task.running_remotely() (missing in some versions).
-    - Instead rely on CLEARML_TASK_ID which is set on remote workers.
+    Initialize ClearML and (if local) enqueue the task for remote execution.
+    Important: Connect CLI args so remote run uses exactly what you launched with.
     """
     if not args.use_clearml:
         return None
 
     from clearml import Task
 
-    # Already on worker -> do NOT enqueue again
+    # If running on the remote worker already, attach/init and continue training normally.
     if os.environ.get("CLEARML_TASK_ID"):
-        t = Task.current_task()
-        if t is None:
-            # fallback: will attach/reuse on worker side
-            t = Task.init(project_name=args.project_name, task_name=args.task_name)
-        return t
-
-    # Local machine: create task and send to queue
-    task = Task.init(project_name=args.project_name, task_name=args.task_name)
-    task.set_base_docker(args.docker)
-    task.execute_remotely(queue_name=args.queue)
-    return task  # local process exits after execute_remotely()
-
-
-def upload_artifact(name: str, filepath: str):
-    """
-    Reliable artifact upload:
-    - Always fetch Task.current_task() at upload time (works on worker)
-    - Never crash training if upload fails
-    """
-    try:
-        from clearml import Task
         task = Task.current_task()
         if task is None:
-            return
-        if not filepath or not os.path.exists(filepath):
-            return
-        task.upload_artifact(name=name, artifact_object=filepath)
-    except Exception:
-        return
+            task = Task.init(project_name=args.project_name, task_name=args.task_name)
+
+        # Connect args so they are visible in UI and saved with the task
+        task.connect(vars(args), name="cli_args")
+        return task
+
+    # Local machine: create task, connect args, set docker, then enqueue.
+    task = Task.init(project_name=args.project_name, task_name=args.task_name)
+    task.connect(vars(args), name="cli_args")
+    task.set_base_docker(args.docker)
+
+    print("[ClearML] Enqueuing task to queue:", args.queue)
+    task.execute_remotely(queue_name=args.queue)
+
+    # After execute_remotely, the local process will terminate.
+    return task
 
 
 class ClearMLScalarCallback(BaseCallback):
-    """
-    Reports a few useful Scalars to ClearML so the UI is not empty:
-    - success_rate from env info ("is_success")
-    - ep_rew_mean based on per-episode returns
-    """
-
+    """Reports a few useful Scalars to ClearML."""
     def __init__(self, report_every_steps: int = 2048):
         super().__init__()
         self.report_every_steps = int(report_every_steps)
-        self._task = None
         self._logger = None
-
-        # Episode tracking
         self._ep_return = 0.0
-        self._ep_len = 0
         self._ep_returns = []
         self._successes = 0
         self._episodes = 0
@@ -196,17 +167,14 @@ class ClearMLScalarCallback(BaseCallback):
     def _on_training_start(self) -> None:
         try:
             from clearml import Task
-            self._task = Task.current_task()
-            self._logger = self._task.get_logger() if self._task else None
+            task = Task.current_task()
+            self._logger = task.get_logger() if task else None
         except Exception:
-            self._task = None
             self._logger = None
 
     def _on_step(self) -> bool:
-        # rewards is a vector for VecEnv; use first env
         reward = float(self.locals["rewards"][0])
         self._ep_return += reward
-        self._ep_len += 1
 
         dones = self.locals["dones"]
         infos = self.locals["infos"]
@@ -214,24 +182,17 @@ class ClearMLScalarCallback(BaseCallback):
         if bool(dones[0]):
             self._episodes += 1
             self._ep_returns.append(self._ep_return)
-
-            # success flag from wrapper info
-            is_success = bool(infos[0].get("is_success", False))
-            if is_success:
+            if bool(infos[0].get("is_success", False)):
                 self._successes += 1
-
-            # reset episode counters
             self._ep_return = 0.0
-            self._ep_len = 0
 
         if self._logger and (self.num_timesteps % self.report_every_steps == 0):
-            # compute rolling stats (last 50 eps)
             window = 50
             recent = self._ep_returns[-window:] if self._ep_returns else []
             ep_rew_mean = sum(recent) / len(recent) if recent else 0.0
             success_rate = (self._successes / self._episodes) if self._episodes > 0 else 0.0
-
             it = int(self.num_timesteps)
+
             self._logger.report_scalar("rollout", "ep_rew_mean_est", ep_rew_mean, iteration=it)
             self._logger.report_scalar("rollout", "success_rate_est", success_rate, iteration=it)
             self._logger.report_scalar("time", "timesteps", it, iteration=it)
@@ -242,24 +203,47 @@ class ClearMLScalarCallback(BaseCallback):
 def main():
     args = parse_args()
 
-    # If enabled, enqueue to ClearML and run remotely (local process exits after enqueue)
+    # Print argv early so it appears in both local and remote logs
+    print("ARGV:", sys.argv)
+
+    # ClearML remote execution hook (local enqueues and exits; remote continues)
     _ = maybe_init_clearml(args)
 
+    # If we are still here, we are actually running training (locally or on the worker).
     # Auto-generate run folder name if missing
     if not args.run_name:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.run_name = f"ppo_ot2_{stamp}"
 
-    # Align timesteps to PPO rollout size (n_steps)
+    # Align timesteps to PPO rollout size
     rollout = int(args.n_steps)
     args.total_timesteps = round_up_to_multiple(args.total_timesteps, rollout)
     args.checkpoint_freq = round_up_to_multiple(args.checkpoint_freq, rollout)
 
-    # Model save folder
+    # Model save folder (inside repo on worker)
     model_root = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
     os.makedirs(model_root, exist_ok=True)
 
-    # Environment
+    total = int(args.total_timesteps)
+    chunk = int(args.checkpoint_freq) if int(args.checkpoint_freq) > 0 else total
+
+    print("\n========== TRAINING CONFIG ==========")
+    print("Running remotely (CLEARML_TASK_ID set):", bool(os.environ.get("CLEARML_TASK_ID")))
+    print("ClearML enabled:", bool(args.use_clearml))
+    print("Project:", args.project_name)
+    print("Task name:", args.task_name)
+    print("Queue:", args.queue)
+    print("Run name:", args.run_name)
+    print("Total timesteps (rounded):", total)
+    print("Checkpoint freq (rounded):", chunk)
+    print("PPO n_steps:", args.n_steps)
+    print("Batch size:", args.batch_size)
+    print("Env max_steps:", args.max_steps)
+    print("Env success_threshold:", args.success_threshold)
+    print("Env action_repeat:", args.action_repeat)
+    print("Save dir:", model_root)
+    print("====================================\n")
+
     env = OT2GymEnv(
         render=args.render,
         max_steps=args.max_steps,
@@ -282,35 +266,11 @@ def main():
         ent_coef=args.ent_coef,
     )
 
-    total = int(args.total_timesteps)
-    chunk = int(args.checkpoint_freq)
-    if chunk <= 0:
-        chunk = total
-
-    trained = 0
-
-    print("\n========== TRAINING CONFIG ==========")
-    print("ClearML enabled:", bool(args.use_clearml))
-    print("ClearML project:", args.project_name)
-    print("ClearML task:", args.task_name)
-    print("Queue:", args.queue)
-    print("Run name:", args.run_name)
-    print("Total timesteps:", total)
-    print("Checkpoint freq:", chunk)
-    print("PPO n_steps:", args.n_steps)
-    print("Batch size:", args.batch_size)
-    print("Env max_steps:", args.max_steps)
-    print("Env success_threshold:", args.success_threshold)
-    print("Env action_repeat:", args.action_repeat)
-    print("Save dir:", model_root)
-    print("====================================\n")
-
-    # On remote workers, progress bars can be slow/noisy
-    use_progress_bar = not bool(args.use_clearml)
-
     cb = ClearMLScalarCallback(report_every_steps=args.n_steps)
 
-    # Train in chunks so we checkpoint + upload regularly
+    trained = 0
+    use_progress_bar = not bool(args.use_clearml)  # keep remote logs cleaner
+
     while trained < total:
         this_chunk = min(chunk, total - trained)
 
@@ -324,30 +284,35 @@ def main():
         trained += this_chunk
 
         ckpt_base = os.path.join(model_root, f"ppo_ot2_{trained}_steps")
+        ckpt_zip = f"{ckpt_base}.zip"
         print("Saving checkpoint to:", ckpt_base)
-        model.save(ckpt_base)  # writes ckpt_base + ".zip"
+        model.save(ckpt_base)
 
-        upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=f"{ckpt_base}.zip")
+        print("Checkpoint exists?", os.path.exists(ckpt_zip), ckpt_zip)
+        upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
 
-    # Save final model
     final_base = os.path.join(model_root, "ppo_ot2_final")
+    final_zip = f"{final_base}.zip"
     print("Saving final model to:", final_base)
     model.save(final_base)
-    upload_artifact(name="ppo_final_model", filepath=f"{final_base}.zip")
 
-    # Zip the entire run folder and upload once (easy download)
+    print("Final model exists?", os.path.exists(final_zip), final_zip)
+    upload_artifact(name="ppo_final_model", filepath=final_zip)
+
+    # Zip the entire run folder for one-click download
     try:
         zip_base = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
         zip_file = shutil.make_archive(base_name=zip_base, format="zip", root_dir=model_root)
+        print("Run folder zip exists?", os.path.exists(zip_file), zip_file)
         upload_artifact(name="run_folder_zip", filepath=zip_file)
-    except Exception:
-        pass
+    except Exception as e:
+        print("[zip] FAILED:", e)
 
     env.close()
 
     print("\nTraining finished successfully.")
     print("All checkpoints saved under:", model_root)
-    print("If running in ClearML, download from: Task -> Artifacts")
+    print("Download from ClearML: Task -> Artifacts")
 
 
 if __name__ == "__main__":
