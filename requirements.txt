@@ -1,11 +1,16 @@
 stable-baselines3==2.4.1
 gymnasium==1.0.0
 pybullet==3.2.5
+
+# CPU-only PyTorch (CRITICAL)
 torch==2.4.1+cpu
 --extra-index-url https://download.pytorch.org/whl/cpu
+
 numpy==1.24.4
 imageio==2.35.1
 matplotlib==3.7.5
 tqdm==4.66.1
+
+# Experiment tracking
 clearml==2.0.2
 tensorboard==2.13.0
