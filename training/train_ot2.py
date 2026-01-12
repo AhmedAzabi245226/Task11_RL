@@ -7,39 +7,14 @@ Key fixes:
 - No ClearML recursion: local enqueues + exits; worker never enqueues.
 - Worker receives args: args are connected to ClearML and synced on worker.
 - Resume supports ClearML artifacts (authenticated), avoiding 401 from raw URL downloads.
+- Resume_path works for repo-relative paths: tries as-is AND PROJECT_ROOT/<resume_path>.
 - Upload checkpoints + final model + run folder zip to ClearML Artifacts (with diagnostics).
 - Report scalars to ClearML.
 - Optional env recreation each chunk to reduce PyBullet memory creep.
 
 Resume options (priority order):
-1) --resume_path <local_path_on_worker>                (NOT a URL; must exist on worker)
+1) --resume_path <path_on_worker_or_repo_relative>     (NOT a URL; must exist on worker)
 2) --resume_task_id <stage1_task_id> --resume_artifact ppo_final_model
-
-Examples:
-
-Stage 1:
-  python training\\train_ot2.py --use_clearml --queue default ^
-    --project_name "Mentor Group - Alican/Group 1" ^
-    --task_name "OT2_STAGE1_T03" ^
-    --run_name ot2_stage1_t03 ^
-    --success_threshold 0.03 ^
-    --total_timesteps 300000 ^
-    --checkpoint_freq 102400 ^
-    --n_steps 512 --batch_size 64 --n_epochs 5 ^
-    --recreate_env_each_chunk
-
-Stage 2 (resume from Stage 1 artifact):
-  python training\\train_ot2.py --use_clearml --queue default ^
-    --project_name "Mentor Group - Alican/Group 1" ^
-    --task_name "OT2_STAGE2_T01" ^
-    --run_name ot2_stage2_t01 ^
-    --success_threshold 0.01 ^
-    --total_timesteps 700000 ^
-    --checkpoint_freq 102400 ^
-    --n_steps 512 --batch_size 64 --n_epochs 5 ^
-    --resume_task_id <STAGE1_TASK_ID> ^
-    --resume_artifact ppo_final_model ^
-    --recreate_env_each_chunk
 """
 
 from __future__ import annotations
@@ -50,7 +25,7 @@ import argparse
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 # -------------------------------------------------
 # Ensure project root is on sys.path so "envs" imports work
@@ -104,12 +79,22 @@ def parse_args():
     # Resume / staged training
     p.add_argument("--resume_path", type=str, default="", help="Local path to PPO .zip on worker (NOT a URL).")
     p.add_argument("--resume_task_id", type=str, default="", help="ClearML task id to pull resume model from.")
-    p.add_argument("--resume_artifact", type=str, default="ppo_final_model",
-                   help="Artifact name in resume task (default: ppo_final_model).")
-    p.add_argument("--reset_timesteps", action="store_true",
-                   help="Reset SB3 timesteps counter at first learn() call (default: continue).")
-    p.add_argument("--recreate_env_each_chunk", action="store_true",
-                   help="Close/recreate env between chunks (helps avoid long-run PyBullet memory creep).")
+    p.add_argument(
+        "--resume_artifact",
+        type=str,
+        default="ppo_final_model",
+        help="Artifact name in resume task (default: ppo_final_model).",
+    )
+    p.add_argument(
+        "--reset_timesteps",
+        action="store_true",
+        help="Reset SB3 timesteps counter at first learn() call (default: continue).",
+    )
+    p.add_argument(
+        "--recreate_env_each_chunk",
+        action="store_true",
+        help="Close/recreate env between chunks (helps avoid long-run PyBullet memory creep).",
+    )
 
     return p.parse_args()
 
@@ -202,7 +187,7 @@ def resolve_resume_local_path(args) -> str:
     Resolve a local resume path usable on the worker.
 
     Priority:
-    1) --resume_path if it exists locally on the worker (NOT a URL)
+    1) --resume_path: check path as-is, then PROJECT_ROOT/<resume_path>
     2) --resume_task_id + --resume_artifact: download via ClearML SDK (authenticated)
     """
     if args.resume_path and (args.resume_path.startswith("http://") or args.resume_path.startswith("https://")):
@@ -213,9 +198,32 @@ def resolve_resume_local_path(args) -> str:
         )
 
     if args.resume_path:
+        # Diagnostics help if worker CWD is not repo root
+        print("[resume] CWD:", os.getcwd())
+        print("[resume] PROJECT_ROOT:", str(PROJECT_ROOT))
+        print("[resume] resume_path (raw):", args.resume_path)
+
+        # 1) try as provided
         if os.path.exists(args.resume_path):
             return args.resume_path
-        raise FileNotFoundError(f"--resume_path not found on worker: {args.resume_path}")
+
+        # 2) try relative to repo root
+        candidate = os.path.join(str(PROJECT_ROOT), args.resume_path)
+        print("[resume] trying PROJECT_ROOT-resolved:", candidate)
+        if os.path.exists(candidate):
+            return candidate
+
+        # optional: list folder for debugging
+        folder = os.path.join(str(PROJECT_ROOT), os.path.dirname(args.resume_path))
+        if os.path.isdir(folder):
+            try:
+                print("[resume] listing:", folder, "->", os.listdir(folder))
+            except Exception:
+                pass
+
+        raise FileNotFoundError(
+            f"--resume_path not found.\nChecked: {args.resume_path}\nChecked: {candidate}\n"
+        )
 
     if args.resume_task_id:
         from clearml import Task
@@ -427,3 +435,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+##
