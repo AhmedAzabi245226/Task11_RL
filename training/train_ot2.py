@@ -3,20 +3,15 @@ train_ot2.py (Task 11)
 
 PPO training for OT2GymEnv with ClearML remote execution support.
 
-Fixes included:
-- Remote workers may NOT receive CLI args. We detect CLEARML_TASK_ID and attach to the task.
-- We connect args to ClearML as "cli_args" and on the worker we READ them back to overwrite defaults.
-- Artifact upload shows diagnostics (no silent failures).
-- Uploads checkpoints + final model + a zip of the entire run folder.
-- Scalars are reported if ClearML task is available.
+Features / fixes:
+- Prevent ClearML recursion: local machine enqueues and exits; worker never enqueues.
+- Sync CLI args via ClearML config (cli_args), because workers might not receive sys.argv.
+- resume_path supports LOCAL PATH or HTTP(S) URL (ClearML artifact URL). URLs are downloaded on worker.
+- Upload checkpoints + final model + run folder zip to ClearML Artifacts (with diagnostics).
+- Report useful scalars to ClearML.
 
-Added for staged training (Plan A):
-- --resume_path: resume training from a saved PPO .zip (LOCAL PATH or HTTP(S) URL)
-- --reset_timesteps: optional; reset SB3 timesteps counter when resuming (default keeps continuing)
-- --recreate_env_each_chunk: close/recreate env between chunks (helps avoid PyBullet memory creep)
-
-Stage 2 resume_path example (ClearML artifact URL):
-  --resume_path "http://194.171.191.227:8081/.../artifacts/ppo_final_model/ppo_ot2_final.zip"
+Recommended for long runs:
+- --recreate_env_each_chunk to reduce PyBullet memory creep
 """
 
 from __future__ import annotations
@@ -66,12 +61,7 @@ def parse_args():
     # Environment
     # ----------------------------
     p.add_argument("--max_steps", type=int, default=400)
-    p.add_argument(
-        "--success_threshold",
-        type=float,
-        default=0.03,
-        help="Start easier (cm-level). Tighten later for mm-level accuracy.",
-    )
+    p.add_argument("--success_threshold", type=float, default=0.03)
     p.add_argument("--action_repeat", type=int, default=5)
     p.add_argument("--render", action="store_true", help="Enable rendering (not recommended on server)")
 
@@ -104,7 +94,7 @@ def parse_args():
     p.add_argument(
         "--reset_timesteps",
         action="store_true",
-        help="If set, reset SB3 timesteps counter when resuming (default: continue).",
+        help="Reset SB3 timesteps counter when starting/resuming (default: continue).",
     )
     p.add_argument(
         "--recreate_env_each_chunk",
@@ -122,7 +112,6 @@ def round_up_to_multiple(x: int, m: int) -> int:
 
 
 def _cast_like(current_value: Any, new_value: Any) -> Any:
-    """Cast new_value to the type of current_value where possible."""
     try:
         if isinstance(current_value, bool):
             if isinstance(new_value, str):
@@ -162,21 +151,51 @@ def upload_artifact(name: str, filepath: str):
         print(f"[upload_artifact] FAILED {name}: {e}")
 
 
-def maybe_init_clearml_and_sync_args(args):
+def maybe_download_resume(resume_path: str) -> str:
     """
-    ClearML integration that works in BOTH contexts.
+    If resume_path is an http(s) URL (e.g., ClearML artifact URL),
+    download it into PROJECT_ROOT/pretrained/ and return the local path.
+    Otherwise return resume_path unchanged.
+    """
+    if not resume_path:
+        return resume_path
 
-    Remote worker:
-      - attach to existing task and sync args from ClearML 'cli_args' section.
+    if resume_path.startswith("http://") or resume_path.startswith("https://"):
+        dl_dir = os.path.join(str(PROJECT_ROOT), "pretrained")
+        os.makedirs(dl_dir, exist_ok=True)
 
-    Local:
-      - create task, connect args, set docker, enqueue, then local terminates.
+        parsed = urlparse(resume_path)
+        filename = os.path.basename(parsed.path) or "resume_model.zip"
+        local_path = os.path.join(dl_dir, filename)
+
+        print("[resume] Detected URL. Downloading resume model...")
+        print("[resume] URL:", resume_path)
+        print("[resume] Local:", local_path)
+
+        try:
+            urllib.request.urlretrieve(resume_path, local_path)
+        except Exception as e:
+            raise RuntimeError(f"[resume] Download failed from URL:\n{resume_path}\nError: {e}")
+
+        print("[resume] Downloaded:", os.path.exists(local_path), local_path)
+        return local_path
+
+    return resume_path
+
+
+def clearml_setup(args) -> None:
+    """
+    Prevent recursion:
+    - If on worker (CLEARML_TASK_ID set): attach to task and sync args from ClearML.
+    - If local and --use_clearml: create task, connect args, enqueue, then EXIT immediately.
+    - If local and not --use_clearml: do nothing.
     """
     from clearml import Task
+
     running_on_worker = bool(os.environ.get("CLEARML_TASK_ID"))
 
-    # ---- Remote worker path ----
     if running_on_worker:
+        # Worker: attach + sync args
         task = Task.current_task()
         if task is None:
             task = Task.init(project_name=args.project_name, task_name=args.task_name)
@@ -185,11 +204,11 @@ def maybe_init_clearml_and_sync_args(args):
         for k, v in cfg.items():
             if hasattr(args, k):
                 setattr(args, k, _cast_like(getattr(args, k), v))
-        return task
+        return
 
-    # ---- Local enqueue path ----
+    # Local machine:
     if not args.use_clearml:
-        return None
+        return
 
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.connect(vars(args), name="cli_args")
@@ -197,7 +216,9 @@ def maybe_init_clearml_and_sync_args(args):
 
     print("[ClearML] Enqueuing task to queue:", args.queue)
     task.execute_remotely(queue_name=args.queue)
-    return task
+
+    # IMPORTANT: stop local execution to avoid double-run / recursion
+    sys.exit(0)
 
 
 class ClearMLScalarCallback(BaseCallback):
@@ -258,52 +279,16 @@ def make_env(args) -> OT2GymEnv:
     )
 
 
-def maybe_download_resume(resume_path: str) -> str:
-    """
-    If resume_path is an http(s) URL (e.g., ClearML artifact URL),
-    download it into PROJECT_ROOT/pretrained/ and return the local path.
-    Otherwise return resume_path unchanged.
-    """
-    if not resume_path:
-        return resume_path
-
-    if resume_path.startswith("http://") or resume_path.startswith("https://"):
-        dl_dir = os.path.join(str(PROJECT_ROOT), "pretrained")
-        os.makedirs(dl_dir, exist_ok=True)
-
-        parsed = urlparse(resume_path)
-        filename = os.path.basename(parsed.path) or "resume_model.zip"
-        local_path = os.path.join(dl_dir, filename)
-
-        print("[resume] Detected URL. Downloading resume model...")
-        print("[resume] URL:", resume_path)
-        print("[resume] Local:", local_path)
-
-        try:
-            urllib.request.urlretrieve(resume_path, local_path)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to download resume model from URL:\n{resume_path}\nError: {e}"
-            )
-
-        print("[resume] Downloaded:", os.path.exists(local_path), local_path)
-        return local_path
-
-    return resume_path
-
-
 def main():
     args = parse_args()
 
-    # Print argv early
+    # Always print argv (helps verify worker vs local)
     print("ARGV:", sys.argv)
 
-    # If running on a ClearML agent, force ClearML mode so args sync works
-    if os.environ.get("CLEARML_TASK_ID"):
-        args.use_clearml = True
-
-    # Attach/enqueue and (on worker) sync args from ClearML
-    _ = maybe_init_clearml_and_sync_args(args)
+    # ClearML setup:
+    # - local: enqueues + exits
+    # - worker: syncs args and continues
+    clearml_setup(args)
 
     # Auto-generate run folder name if missing
     if not args.run_name:
@@ -324,7 +309,7 @@ def main():
 
     print("\n========== TRAINING CONFIG ==========")
     print("Running remotely (CLEARML_TASK_ID set):", bool(os.environ.get("CLEARML_TASK_ID")))
-    print("ClearML enabled:", bool(args.use_clearml))
+    print("ClearML enabled (flag):", bool(args.use_clearml))
     print("Project:", args.project_name)
     print("Task name:", args.task_name)
     print("Queue:", args.queue)
@@ -343,7 +328,7 @@ def main():
 
     env = make_env(args)
 
-    # If resume_path is a URL, download it locally on the worker
+    # Download resume model if URL
     args.resume_path = maybe_download_resume(args.resume_path)
 
     if args.resume_path:
@@ -368,7 +353,8 @@ def main():
     cb = ClearMLScalarCallback(report_every_steps=args.n_steps)
 
     trained = 0
-    use_progress_bar = not bool(args.use_clearml)  # keep remote logs cleaner
+    # Keep worker logs cleaner; progress bar only locally
+    use_progress_bar = not bool(os.environ.get("CLEARML_TASK_ID"))
 
     while trained < total:
         this_chunk = min(chunk, total - trained)
@@ -380,7 +366,7 @@ def main():
             callback=cb,
         )
 
-        # After first call, never reset again
+        # After first learn call, never reset again
         args.reset_timesteps = False
 
         trained += this_chunk
@@ -393,7 +379,7 @@ def main():
         print("Checkpoint exists?", os.path.exists(ckpt_zip), ckpt_zip)
         upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
 
-        # Optional: recreate env between chunks to avoid long-run sim memory creep
+        # Optional: recreate env between chunks
         if args.recreate_env_each_chunk:
             try:
                 env.close()
@@ -410,7 +396,7 @@ def main():
     print("Final model exists?", os.path.exists(final_zip), final_zip)
     upload_artifact(name="ppo_final_model", filepath=final_zip)
 
-    # Zip the entire run folder for one-click download
+    # Zip whole run folder
     try:
         zip_base = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
         zip_file = shutil.make_archive(base_name=zip_base, format="zip", root_dir=model_root)
