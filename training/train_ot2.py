@@ -9,13 +9,16 @@ Key fixes:
 - Worker receives args: args are connected to ClearML and synced on worker.
 - Resume supports ClearML artifacts (authenticated), avoiding 401 from raw URL downloads.
 - Resume_path works for repo-relative paths: tries as-is AND PROJECT_ROOT/<resume_path>.
-- Upload checkpoints + final model + run folder zip to ClearML Artifacts (blocking upload + flush).
+- Upload artifacts SAFELY:
+    * by default: upload ONLY final model (+ optional run zip)
+    * checkpoint uploads are OFF by default (most common cause of exit code 139 in your logs)
+    * if enabled: upload happens only after closing VecEnv (releases PyBullet native memory)
 - Report scalars to ClearML.
 - Optional env recreation each chunk to reduce PyBullet memory creep.
 
 Resume options (priority order):
 1) --resume_path <path_on_worker_or_repo_relative>     (NOT a URL; must exist on worker)
-2) --resume_task_id <stage1_task_id> --resume_artifact ppo_final_model
+2) --resume_task_id <stage_task_id> --resume_artifact ppo_final_model
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import shutil
 import gc
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 # -------------------------------------------------
 # Ensure project root is on sys.path so "envs" imports work
@@ -39,6 +42,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from envs.ot2_gym_wrapper import OT2GymEnv
 
 
@@ -76,17 +81,37 @@ def parse_args():
 
     # Timesteps
     p.add_argument("--total_timesteps", type=int, default=204_800)
-    p.add_argument("--checkpoint_freq", type=int, default=10_240)
+    p.add_argument("--checkpoint_freq", type=int, default=102_400)
 
     # Resume / staged training
     p.add_argument("--resume_path", type=str, default="", help="Path to PPO .zip on WORKER or repo-relative (NOT a URL).")
     p.add_argument("--resume_task_id", type=str, default="", help="ClearML task id to pull resume model from.")
-    p.add_argument("--resume_artifact", type=str, default="ppo_final_model",
-                   help="Artifact name in resume task (default: ppo_final_model).")
-    p.add_argument("--reset_timesteps", action="store_true",
-                   help="Reset SB3 timesteps counter at first learn() call (default: continue).")
-    p.add_argument("--recreate_env_each_chunk", action="store_true",
-                   help="Close/recreate env between chunks (helps avoid long-run PyBullet memory creep).")
+    p.add_argument(
+        "--resume_artifact",
+        type=str,
+        default="ppo_final_model",
+        help="Artifact name in resume task (default: ppo_final_model).",
+    )
+    p.add_argument(
+        "--reset_timesteps",
+        action="store_true",
+        help="Reset SB3 timesteps counter at first learn() call (default: continue).",
+    )
+    p.add_argument(
+        "--recreate_env_each_chunk",
+        action="store_true",
+        help="Close/recreate env between chunks (helps avoid long-run PyBullet memory creep).",
+    )
+
+    # Upload controls (IMPORTANT)
+    p.add_argument("--upload_checkpoints", action="store_true", help="Upload checkpoint artifacts to ClearML (OFF by default).")
+    p.add_argument("--upload_final", action="store_true", help="Upload final model artifact to ClearML (ON by default).")
+    p.add_argument("--upload_run_zip", action="store_true", help="Upload run folder zip to ClearML (OFF by default).")
+    p.set_defaults(upload_checkpoints=False, upload_final=True, upload_run_zip=False)
+
+    # If upload_checkpoints is enabled, reduce frequency if needed
+    p.add_argument("--upload_every_n_checkpoints", type=int, default=1,
+                   help="If uploading checkpoints, only upload every Nth checkpoint (default: 1 = all).")
 
     return p.parse_args()
 
@@ -117,16 +142,10 @@ def _cast_like(current_value: Any, new_value: Any) -> Any:
 # ClearML helpers (robust)
 # ----------------------------
 def _is_worker() -> bool:
-    # Some agents set CLEARML_WORKER_ID reliably
     return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"))
 
 
 def _get_task():
-    """
-    Robustly get the running ClearML task.
-    - Prefer Task.current_task()
-    - Fall back to Task.get_task(task_id=CLEARML_TASK_ID) if needed
-    """
     try:
         from clearml import Task
         t = Task.current_task()
@@ -144,9 +163,6 @@ def clearml_setup_and_sync_args(args) -> Optional[str]:
     Prevent recursion:
     - Worker: attach to current task and sync args from ClearML.
     - Local + --use_clearml: create task, connect args, enqueue, then EXIT immediately.
-
-    Returns:
-        current_task_id (str) on worker, else None.
     """
     if not args.use_clearml and not _is_worker():
         return None
@@ -154,8 +170,7 @@ def clearml_setup_and_sync_args(args) -> Optional[str]:
     from clearml import Task
 
     if _is_worker():
-        args.use_clearml = True  # ensure enabled on worker
-
+        args.use_clearml = True
         task = _get_task()
         if task is None:
             tid = os.environ.get("CLEARML_TASK_ID")
@@ -171,7 +186,6 @@ def clearml_setup_and_sync_args(args) -> Optional[str]:
         print(f"[ClearML] Worker attached to task_id={task.id}")
         return task.id
 
-    # Local machine: enqueue then exit
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.connect(vars(args), name="cli_args")
     task.set_base_docker(args.docker)
@@ -181,8 +195,10 @@ def clearml_setup_and_sync_args(args) -> Optional[str]:
     raise SystemExit(0)
 
 
+# ----------------------------
+# Memory cleanup
+# ----------------------------
 def _cleanup_memory(tag: str = ""):
-    """Best-effort cleanup between chunks to reduce native/GPU fragmentation."""
     try:
         gc.collect()
     except Exception:
@@ -197,29 +213,26 @@ def _cleanup_memory(tag: str = ""):
         print(f"[mem] cleanup done: {tag}")
 
 
+# ----------------------------
+# Upload (safe)
+# ----------------------------
 def upload_artifact(name: str, filepath: str):
     """
-    Upload an artifact to ClearML with visible diagnostics.
-
-    Stability: uses blocking upload + flush to reduce crash likelihood
-    around artifact handling (some environments crash on background upload threads).
+    Upload artifact. Best-effort, never crash training if upload fails.
     """
     try:
         task = _get_task()
         if task is None:
             print(f"[upload_artifact] No current ClearML task. Skipping {name}.")
             return
-        if not filepath:
-            print(f"[upload_artifact] Empty filepath for {name}.")
-            return
-        if not os.path.exists(filepath):
-            print(f"[upload_artifact] File not found for {name}: {filepath}")
+        if not filepath or not os.path.exists(filepath):
+            print(f"[upload_artifact] Missing file for {name}: {filepath}")
             return
 
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
         print(f"[upload_artifact] Uploading {name}: {filepath} ({size_mb:.2f} MB)")
 
-        # Blocking upload + flush
+        # Blocking upload tends to be more stable on long jobs
         task.upload_artifact(name=name, artifact_object=filepath, wait_on_upload=True)
         try:
             task.flush(wait_for_uploads=True)
@@ -232,19 +245,14 @@ def upload_artifact(name: str, filepath: str):
         print(f"[upload_artifact] FAILED {name}: {e}")
 
 
+# ----------------------------
+# Resume resolution
+# ----------------------------
 def resolve_resume_local_path(args) -> str:
-    """
-    Resolve a local resume path usable on the worker.
-
-    Priority:
-    1) --resume_path: check path as-is, then PROJECT_ROOT/<resume_path>
-    2) --resume_task_id + --resume_artifact: download via ClearML SDK (authenticated)
-    """
     if args.resume_path and (args.resume_path.startswith("http://") or args.resume_path.startswith("https://")):
         raise RuntimeError(
-            "resume_path is an HTTP(S) URL. ClearML files server often returns 401 to raw downloads.\n"
-            "Use: --resume_task_id <TASK_ID> --resume_artifact ppo_final_model\n"
-            "Or download locally and pass a local path that exists on the worker."
+            "resume_path is an HTTP(S) URL. Use ClearML artifact resume instead:\n"
+            "--resume_task_id <TASK_ID> --resume_artifact ppo_final_model"
         )
 
     if args.resume_path:
@@ -288,7 +296,6 @@ def resolve_resume_local_path(args) -> str:
 # Scalars
 # ----------------------------
 class ClearMLScalarCallback(BaseCallback):
-    """Reports a few useful scalars to ClearML (if logger exists)."""
     def __init__(self, report_every_steps: int = 2048):
         super().__init__()
         self.report_every_steps = int(report_every_steps)
@@ -336,17 +343,33 @@ class ClearMLScalarCallback(BaseCallback):
 
 
 # ----------------------------
-# Env factory
+# VecEnv factory (important!)
 # ----------------------------
-def make_env(args) -> OT2GymEnv:
-    return OT2GymEnv(
-        render=args.render,
-        max_steps=args.max_steps,
-        success_threshold=args.success_threshold,
-        seed=args.seed,
-        debug=False,
-        action_repeat=args.action_repeat,
-    )
+def make_vec_env(args) -> VecMonitor:
+    def _make() -> OT2GymEnv:
+        env = OT2GymEnv(
+            render=args.render,
+            max_steps=args.max_steps,
+            success_threshold=args.success_threshold,
+            seed=args.seed,
+            debug=False,
+            action_repeat=args.action_repeat,
+        )
+        # Monitor records episode stats properly and tends to close cleanly
+        return Monitor(env)
+
+    vec = DummyVecEnv([_make])
+    vec = VecMonitor(vec)
+    return vec
+
+
+def safe_close_vec_env(vec_env):
+    try:
+        if vec_env is not None:
+            vec_env.close()
+    except Exception:
+        pass
+    _cleanup_memory(tag="after vec_env.close()")
 
 
 # ----------------------------
@@ -354,7 +377,6 @@ def make_env(args) -> OT2GymEnv:
 # ----------------------------
 def main():
     args = parse_args()
-
     print("ARGV:", sys.argv)
 
     current_task_id = clearml_setup_and_sync_args(args)
@@ -373,7 +395,6 @@ def main():
     total = int(args.total_timesteps)
     chunk = int(args.checkpoint_freq) if int(args.checkpoint_freq) > 0 else total
 
-    env = make_env(args)
     resume_local = resolve_resume_local_path(args)
 
     print("\n========== TRAINING CONFIG ==========")
@@ -390,21 +411,23 @@ def main():
     print("Env max_steps:", args.max_steps)
     print("Env success_threshold:", args.success_threshold)
     print("Env action_repeat:", args.action_repeat)
-    print("Resume path arg:", args.resume_path if args.resume_path else "(none)")
-    print("Resume task id:", args.resume_task_id if args.resume_task_id else "(none)")
-    print("Resume artifact:", args.resume_artifact)
-    print("Resolved resume local:", resume_local if resume_local else "(none)")
+    print("Resume local:", resume_local if resume_local else "(none)")
     print("Recreate env each chunk:", bool(args.recreate_env_each_chunk))
+    print("UPLOAD checkpoints:", bool(args.upload_checkpoints))
+    print("UPLOAD final:", bool(args.upload_final))
+    print("UPLOAD run zip:", bool(args.upload_run_zip))
     print("Save dir:", model_root)
     print("====================================\n")
 
+    vec_env = make_vec_env(args)
+
     if resume_local:
         print("Resuming PPO from:", resume_local)
-        model = PPO.load(resume_local, env=env, device="auto")
+        model = PPO.load(resume_local, env=vec_env, device="auto")
     else:
         model = PPO(
             "MlpPolicy",
-            env,
+            vec_env,
             verbose=1,
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
@@ -419,6 +442,7 @@ def main():
 
     trained = 0
     use_progress_bar = not _is_worker()
+    ckpt_index = 0
 
     while trained < total:
         this_chunk = min(chunk, total - trained)
@@ -430,51 +454,62 @@ def main():
             callback=cb,
         )
         args.reset_timesteps = False
-
         trained += this_chunk
+        ckpt_index += 1
 
         ckpt_base = os.path.join(model_root, f"ppo_ot2_{trained}_steps")
         ckpt_zip = f"{ckpt_base}.zip"
         print("Saving checkpoint to:", ckpt_base)
         model.save(ckpt_base)
-
         print("Checkpoint exists?", os.path.exists(ckpt_zip), ckpt_zip)
-        upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
 
-        # Strong cleanup point
-        _cleanup_memory(tag=f"after checkpoint {trained}")
+        # ---- SAFE UPLOAD STRATEGY ----
+        # Uploading while Bullet is alive is where you keep crashing.
+        # If checkpoint uploads are enabled, we close vec_env BEFORE upload, then recreate it after.
+        do_upload = (
+            args.upload_checkpoints
+            and (ckpt_index % max(1, int(args.upload_every_n_checkpoints)) == 0)
+        )
+        if do_upload:
+            print("[checkpoint-upload] Closing env before upload for stability...")
+            safe_close_vec_env(vec_env)
 
-        if args.recreate_env_each_chunk:
-            try:
-                env.close()
-            except Exception:
-                pass
-            # recreate env after hard close/disconnect (wrapper handles PyBullet)
-            env = make_env(args)
-            model.set_env(env)
+            upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
 
-        _cleanup_memory(tag=f"after env recreate {trained}")
+            print("[checkpoint-upload] Recreating env after upload...")
+            vec_env = make_vec_env(args)
+            model.set_env(vec_env)
 
+        # Optional env recreation even if not uploading (helps Bullet memory creep)
+        if args.recreate_env_each_chunk and not do_upload:
+            print("[env] Recreating env between chunks...")
+            safe_close_vec_env(vec_env)
+            vec_env = make_vec_env(args)
+            model.set_env(vec_env)
+
+        _cleanup_memory(tag=f"after chunk {trained}")
+
+    # Final save
     final_base = os.path.join(model_root, "ppo_ot2_final")
     final_zip = f"{final_base}.zip"
     print("Saving final model to:", final_base)
     model.save(final_base)
-
     print("Final model exists?", os.path.exists(final_zip), final_zip)
-    upload_artifact(name="ppo_final_model", filepath=final_zip)
 
-    try:
-        zip_base = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
-        zip_file = shutil.make_archive(base_name=zip_base, format="zip", root_dir=model_root)
-        print("Run folder zip exists?", os.path.exists(zip_file), zip_file)
-        upload_artifact(name="run_folder_zip", filepath=zip_file)
-    except Exception as e:
-        print("[zip] FAILED:", e)
+    # Close env BEFORE final uploads (most stable)
+    safe_close_vec_env(vec_env)
 
-    try:
-        env.close()
-    except Exception:
-        pass
+    if args.upload_final:
+        upload_artifact(name="ppo_final_model", filepath=final_zip)
+
+    if args.upload_run_zip:
+        try:
+            zip_base = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
+            zip_file = shutil.make_archive(base_name=zip_base, format="zip", root_dir=model_root)
+            print("Run folder zip exists?", os.path.exists(zip_file), zip_file)
+            upload_artifact(name="run_folder_zip", filepath=zip_file)
+        except Exception as e:
+            print("[zip] FAILED:", e)
 
     _cleanup_memory(tag="final")
 
