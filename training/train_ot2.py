@@ -4,7 +4,7 @@ train_ot2.py (Task 11)
 PPO training for OT2GymEnv with robust ClearML remote execution support.
 
 Key fixes:
-- No ClearML recursion: local enqueues + exits; worker never enqueues.
+- No ClearML recursion: local enqueues + exits; worker never enqueues and never Task.init() again.
 - Worker receives args: args are connected to ClearML and synced on worker.
 - Resume supports ClearML artifacts (authenticated), avoiding 401 from raw URL downloads.
 - Resume_path works for repo-relative paths: tries as-is AND PROJECT_ROOT/<resume_path>.
@@ -15,6 +15,32 @@ Key fixes:
 Resume options (priority order):
 1) --resume_path <path_on_worker_or_repo_relative>     (NOT a URL; must exist on worker)
 2) --resume_task_id <stage1_task_id> --resume_artifact ppo_final_model
+
+Examples:
+
+Stage 1:
+  python training\\train_ot2.py --use_clearml --queue default ^
+    --project_name "Mentor Group - Alican/Group 1" ^
+    --task_name "OT2_STAGE1_T03" ^
+    --run_name ot2_stage1_t03 ^
+    --success_threshold 0.03 ^
+    --total_timesteps 300000 ^
+    --checkpoint_freq 102400 ^
+    --n_steps 512 --batch_size 64 --n_epochs 5 ^
+    --recreate_env_each_chunk
+
+Stage 2 (resume from Stage 1 artifact):
+  python training\\train_ot2.py --use_clearml --queue default ^
+    --project_name "Mentor Group - Alican/Group 1" ^
+    --task_name "OT2_STAGE2_T01" ^
+    --run_name ot2_stage2_t01 ^
+    --success_threshold 0.01 ^
+    --total_timesteps 700000 ^
+    --checkpoint_freq 102400 ^
+    --n_steps 512 --batch_size 64 --n_epochs 5 ^
+    --resume_task_id <STAGE1_TASK_ID> ^
+    --resume_artifact ppo_final_model ^
+    --recreate_env_each_chunk
 """
 
 from __future__ import annotations
@@ -25,7 +51,7 @@ import argparse
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # -------------------------------------------------
 # Ensure project root is on sys.path so "envs" imports work
@@ -77,7 +103,7 @@ def parse_args():
     p.add_argument("--checkpoint_freq", type=int, default=10_240)
 
     # Resume / staged training
-    p.add_argument("--resume_path", type=str, default="", help="Local path to PPO .zip on worker (NOT a URL).")
+    p.add_argument("--resume_path", type=str, default="", help="Path to PPO .zip on WORKER or repo-relative (NOT a URL).")
     p.add_argument("--resume_task_id", type=str, default="", help="ClearML task id to pull resume model from.")
     p.add_argument(
         "--resume_artifact",
@@ -124,31 +150,39 @@ def _cast_like(current_value: Any, new_value: Any) -> Any:
 # ----------------------------
 # ClearML
 # ----------------------------
-def clearml_setup_and_sync_args(args) -> None:
+def _is_worker() -> bool:
+    return bool(os.environ.get("CLEARML_TASK_ID"))
+
+
+def clearml_setup_and_sync_args(args) -> Optional[str]:
     """
     Prevent recursion:
     - Worker (CLEARML_TASK_ID set): attach to current task and sync args from ClearML.
     - Local + --use_clearml: create task, connect args, enqueue, then EXIT immediately.
+
+    Returns:
+        current_task_id (str) on worker, else None.
     """
-    if not args.use_clearml and not os.environ.get("CLEARML_TASK_ID"):
-        return  # no clearml at all
+    if not args.use_clearml and not _is_worker():
+        return None  # no clearml at all
 
     from clearml import Task
 
-    running_on_worker = bool(os.environ.get("CLEARML_TASK_ID"))
-
-    if running_on_worker:
-        # IMPORTANT: never enqueue on worker
+    if _is_worker():
+        # IMPORTANT: never enqueue or Task.init() on worker
         task = Task.current_task()
         if task is None:
-            # Fallback: attach to the task id (prevents accidental Task.init recursion)
+            # If agent didn't set it properly, attach by id (still no Task.init)
             task = Task.get_task(task_id=os.environ["CLEARML_TASK_ID"])
 
         cfg = task.connect(vars(args), name="cli_args")
         for k, v in cfg.items():
             if hasattr(args, k):
                 setattr(args, k, _cast_like(getattr(args, k), v))
-        return
+
+        # Loud proof we are attached to correct task
+        print(f"[ClearML] Worker attached to task_id={task.id}")
+        return task.id
 
     # Local machine: enqueue then exit
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
@@ -221,9 +255,7 @@ def resolve_resume_local_path(args) -> str:
             except Exception:
                 pass
 
-        raise FileNotFoundError(
-            f"--resume_path not found.\nChecked: {args.resume_path}\nChecked: {candidate}\n"
-        )
+        raise FileNotFoundError(f"--resume_path not found. Checked: {args.resume_path} and {candidate}")
 
     if args.resume_task_id:
         from clearml import Task
@@ -259,8 +291,10 @@ class ClearMLScalarCallback(BaseCallback):
             from clearml import Task
             task = Task.current_task()
             self._logger = task.get_logger() if task else None
+            print("[ClearML] logger active:", bool(self._logger))
         except Exception:
             self._logger = None
+            print("[ClearML] logger active: False (exception)")
 
     def _on_step(self) -> bool:
         reward = float(self.locals["rewards"][0])
@@ -314,7 +348,7 @@ def main():
     print("ARGV:", sys.argv)
 
     # ClearML setup: local enqueues+exits, worker syncs args and continues
-    clearml_setup_and_sync_args(args)
+    current_task_id = clearml_setup_and_sync_args(args)
 
     # Auto run name
     if not args.run_name:
@@ -337,7 +371,8 @@ def main():
     resume_local = resolve_resume_local_path(args)
 
     print("\n========== TRAINING CONFIG ==========")
-    print("Running remotely (CLEARML_TASK_ID set):", bool(os.environ.get("CLEARML_TASK_ID")))
+    print("Running remotely (CLEARML_TASK_ID set):", _is_worker())
+    print("ClearML task id:", current_task_id if current_task_id else "(none)")
     print("Project:", args.project_name)
     print("Task name:", args.task_name)
     print("Queue:", args.queue)
@@ -377,7 +412,7 @@ def main():
     cb = ClearMLScalarCallback(report_every_steps=args.n_steps)
 
     trained = 0
-    use_progress_bar = not bool(os.environ.get("CLEARML_TASK_ID"))  # keep worker logs cleaner
+    use_progress_bar = not _is_worker()  # keep worker logs cleaner
 
     while trained < total:
         this_chunk = min(chunk, total - trained)
@@ -435,4 +470,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-##
