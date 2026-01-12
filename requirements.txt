@@ -1,11 +1,12 @@
-cd D:\myfile\Y2-B\Task11_RL
-(
-echo stable-baselines3==2.4.1
-echo gymnasium==1.0.0
-echo pybullet==3.2.6
-echo numpy==1.24.4
-echo imageio==2.35.1
-echo tqdm==4.66.1
-echo clearml==2.0.2
-echo tensorboard==2.13.0
-) > requirements.txt
+stable-baselines3==2.4.1
+gymnasium==1.0.0
+numpy==1.24.4
+imageio==2.35.1
+tqdm==4.66.1
+clearml==2.0.2
+tensorboard==2.13.0
+pybullet==3.2.6
+
+# Force CPU-only torch on ClearML worker
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1+cpu
