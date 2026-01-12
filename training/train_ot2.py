@@ -1,26 +1,3 @@
-"""
-train_ot2.py (Task 11)
-
-PPO training for OT2GymEnv with robust ClearML remote execution support.
-
-Key fixes:
-- No ClearML recursion: local enqueues + exits; worker never enqueues and never Task.init() again.
-- Worker detection is robust: checks CLEARML_TASK_ID OR CLEARML_WORKER_ID.
-- Worker receives args: args are connected to ClearML and synced on worker.
-- Resume supports ClearML artifacts (authenticated), avoiding 401 from raw URL downloads.
-- Resume_path works for repo-relative paths: tries as-is AND PROJECT_ROOT/<resume_path>.
-- Upload artifacts SAFELY:
-    * by default: upload ONLY final model (+ optional run zip)
-    * checkpoint uploads are OFF by default (most common cause of exit code 139 in your logs)
-    * if enabled: upload happens only after closing VecEnv (releases PyBullet native memory)
-- Report scalars to ClearML.
-- Optional env recreation each chunk to reduce PyBullet memory creep.
-
-Resume options (priority order):
-1) --resume_path <path_on_worker_or_repo_relative>     (NOT a URL; must exist on worker)
-2) --resume_task_id <stage_task_id> --resume_artifact ppo_final_model
-"""
-
 from __future__ import annotations
 
 import os
@@ -30,22 +7,21 @@ import shutil
 import gc
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Callable
+from typing import Any, Optional
 
 # -------------------------------------------------
-# Ensure project root is on sys.path so "envs" imports work
+# Force correct project root
 # -------------------------------------------------
-THIS_DIR = Path(__file__).resolve().parent          # .../Task11_RL/training
-PROJECT_ROOT = THIS_DIR.parent                      # .../Task11_RL
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+THIS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = THIS_DIR.parent
+os.chdir(str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from envs.ot2_gym_wrapper import OT2GymEnv
-
 
 # ----------------------------
 # Args
