@@ -10,14 +10,33 @@ Fixes included:
 - Uploads checkpoints + final model + a zip of the entire run folder.
 - Scalars are reported if ClearML task is available.
 
-Remote run (Windows cmd):
+Added for staged training (Plan A):
+- --resume_path: resume training from a saved PPO .zip
+- --reset_timesteps: optional; reset SB3 timesteps counter (default keeps continuing)
+- --recreate_env_each_chunk: close/recreate env between chunks (helps avoid PyBullet memory creep)
+
+Example Stage 1:
   python training\\train_ot2.py --use_clearml --queue default ^
     --project_name "Mentor Group - Alican/Group 1" ^
-    --task_name "OT2_FINAL_RUN_2M" ^
-    --run_name ot2_final_2m ^
-    --total_timesteps 2000000 ^
+    --task_name "OT2_STAGE1_T03" ^
+    --run_name ot2_stage1_t03 ^
+    --success_threshold 0.03 ^
+    --total_timesteps 300000 ^
     --checkpoint_freq 102400 ^
-    --n_steps 1024 --batch_size 128 --action_repeat 5
+    --n_steps 512 --batch_size 64 --n_epochs 5 ^
+    --recreate_env_each_chunk
+
+Example Stage 2 (resume Stage 1 final):
+  python training\\train_ot2.py --use_clearml --queue default ^
+    --project_name "Mentor Group - Alican/Group 1" ^
+    --task_name "OT2_STAGE2_T01_RESUME" ^
+    --run_name ot2_stage2_t01 ^
+    --success_threshold 0.01 ^
+    --total_timesteps 700000 ^
+    --checkpoint_freq 102400 ^
+    --n_steps 512 --batch_size 64 --n_epochs 5 ^
+    --resume_path "<LOCAL_PATH_TO_STAGE1_FINAL_ZIP>" ^
+    --recreate_env_each_chunk
 """
 
 import os
@@ -89,6 +108,21 @@ def parse_args():
     p.add_argument("--total_timesteps", type=int, default=204_800)
     p.add_argument("--checkpoint_freq", type=int, default=10_240)
 
+    # ----------------------------
+    # Resume / staged training
+    # ----------------------------
+    p.add_argument("--resume_path", type=str, default="", help="Path to a PPO .zip to resume from")
+    p.add_argument(
+        "--reset_timesteps",
+        action="store_true",
+        help="If set, reset SB3 timesteps counter when resuming (default: continue).",
+    )
+    p.add_argument(
+        "--recreate_env_each_chunk",
+        action="store_true",
+        help="Close/recreate env between chunks (helps avoid long-run PyBullet memory creep).",
+    )
+
     return p.parse_args()
 
 
@@ -102,7 +136,6 @@ def _cast_like(current_value: Any, new_value: Any) -> Any:
     """Cast new_value to the type of current_value where possible."""
     try:
         if isinstance(current_value, bool):
-            # ClearML might store as "true"/"false" strings
             if isinstance(new_value, str):
                 return new_value.strip().lower() in ("1", "true", "yes", "y", "on")
             return bool(new_value)
@@ -142,35 +175,21 @@ def upload_artifact(name: str, filepath: str):
 
 def maybe_init_clearml_and_sync_args(args):
     """
-    ClearML integration that works in BOTH contexts:
-
-    Local:
-      - create task, connect args, set docker, enqueue to queue
-      - local process terminates after execute_remotely()
-
-    Remote worker:
-      - attach to existing task (Task.current_task)
-      - connect args to 'cli_args' and READ them back to overwrite defaults,
-        because worker may not receive CLI args at all.
+    ClearML integration that works in BOTH contexts.
     """
     from clearml import Task
-
     running_on_worker = bool(os.environ.get("CLEARML_TASK_ID"))
 
     # ---- Remote worker path ----
     if running_on_worker:
         task = Task.current_task()
         if task is None:
-            # Fallback: init (should be rare)
             task = Task.init(project_name=args.project_name, task_name=args.task_name)
 
-        # Connect and read back args
         cfg = task.connect(vars(args), name="cli_args")
-        # Overwrite argparse args from cfg so defaults do not run
         for k, v in cfg.items():
             if hasattr(args, k):
                 setattr(args, k, _cast_like(getattr(args, k), v))
-
         return task
 
     # ---- Local enqueue path ----
@@ -233,31 +252,35 @@ class ClearMLScalarCallback(BaseCallback):
         return True
 
 
+def make_env(args) -> OT2GymEnv:
+    return OT2GymEnv(
+        render=args.render,
+        max_steps=args.max_steps,
+        success_threshold=args.success_threshold,
+        seed=args.seed,
+        debug=False,
+        action_repeat=args.action_repeat,
+    )
+
+
 def main():
     args = parse_args()
 
-    # Print argv early
     print("ARGV:", sys.argv)
 
-    # Critical: On ClearML agents, CLI args may not be forwarded.
-    # If CLEARML_TASK_ID is set, force ClearML mode so we attach and sync args.
     if os.environ.get("CLEARML_TASK_ID"):
         args.use_clearml = True
 
-    # Attach/enqueue and (on worker) sync args from ClearML
     _ = maybe_init_clearml_and_sync_args(args)
 
-    # Auto-generate run folder name if missing
     if not args.run_name:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.run_name = f"ppo_ot2_{stamp}"
 
-    # Align timesteps to PPO rollout size
     rollout = int(args.n_steps)
     args.total_timesteps = round_up_to_multiple(args.total_timesteps, rollout)
     args.checkpoint_freq = round_up_to_multiple(args.checkpoint_freq, rollout)
 
-    # Model save folder
     model_root = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
     os.makedirs(model_root, exist_ok=True)
 
@@ -278,35 +301,36 @@ def main():
     print("Env max_steps:", args.max_steps)
     print("Env success_threshold:", args.success_threshold)
     print("Env action_repeat:", args.action_repeat)
+    print("Resume path:", args.resume_path if args.resume_path else "(none)")
+    print("Recreate env each chunk:", bool(args.recreate_env_each_chunk))
     print("Save dir:", model_root)
     print("====================================\n")
 
-    env = OT2GymEnv(
-        render=args.render,
-        max_steps=args.max_steps,
-        success_threshold=args.success_threshold,
-        seed=args.seed,
-        debug=False,
-        action_repeat=args.action_repeat,
-    )
+    env = make_env(args)
 
-    model = PPO(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        learning_rate=args.learning_rate,
-        batch_size=args.batch_size,
-        n_steps=args.n_steps,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        clip_range=args.clip_range,
-        ent_coef=args.ent_coef,
-    )
+    if args.resume_path:
+        if not os.path.exists(args.resume_path):
+            raise FileNotFoundError(f"--resume_path not found: {args.resume_path}")
+        print("Resuming from:", args.resume_path)
+        model = PPO.load(args.resume_path, env=env, device="auto")
+    else:
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=1,
+            learning_rate=args.learning_rate,
+            batch_size=args.batch_size,
+            n_steps=args.n_steps,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            clip_range=args.clip_range,
+            ent_coef=args.ent_coef,
+        )
 
     cb = ClearMLScalarCallback(report_every_steps=args.n_steps)
 
     trained = 0
-    use_progress_bar = not bool(args.use_clearml)  # keep remote logs cleaner
+    use_progress_bar = not bool(args.use_clearml)
 
     while trained < total:
         this_chunk = min(chunk, total - trained)
@@ -314,9 +338,12 @@ def main():
         model.learn(
             total_timesteps=this_chunk,
             progress_bar=use_progress_bar,
-            reset_num_timesteps=False,
+            reset_num_timesteps=bool(args.reset_timesteps),
             callback=cb,
         )
+
+        # After first call, never reset again
+        args.reset_timesteps = False
 
         trained += this_chunk
 
@@ -328,6 +355,15 @@ def main():
         print("Checkpoint exists?", os.path.exists(ckpt_zip), ckpt_zip)
         upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
 
+        # Optional: recreate env between chunks to avoid long-run sim memory creep
+        if args.recreate_env_each_chunk:
+            try:
+                env.close()
+            except Exception:
+                pass
+            env = make_env(args)
+            model.set_env(env)
+
     final_base = os.path.join(model_root, "ppo_ot2_final")
     final_zip = f"{final_base}.zip"
     print("Saving final model to:", final_base)
@@ -336,7 +372,6 @@ def main():
     print("Final model exists?", os.path.exists(final_zip), final_zip)
     upload_artifact(name="ppo_final_model", filepath=final_zip)
 
-    # Zip the entire run folder for one-click download
     try:
         zip_base = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
         zip_file = shutil.make_archive(base_name=zip_base, format="zip", root_dir=model_root)
