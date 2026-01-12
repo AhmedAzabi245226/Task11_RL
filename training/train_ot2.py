@@ -3,11 +3,12 @@ train_ot2.py (Task 11)
 
 PPO training for OT2GymEnv with ClearML remote execution support.
 
-Key fixes:
-- Explicitly connects CLI args to ClearML (task.connect) so remote runs do not silently use defaults.
-- Prints sys.argv + resolved config in remote log for verification.
-- Artifact upload prints diagnostics (no silent failures).
+Fixes included:
+- Remote workers may NOT receive CLI args. We detect CLEARML_TASK_ID and attach to the task.
+- We connect args to ClearML as "cli_args" and on the worker we READ them back to overwrite defaults.
+- Artifact upload shows diagnostics (no silent failures).
 - Uploads checkpoints + final model + a zip of the entire run folder.
+- Scalars are reported if ClearML task is available.
 
 Remote run (Windows cmd):
   python training\\train_ot2.py --use_clearml --queue default ^
@@ -25,6 +26,7 @@ import argparse
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 # -------------------------------------------------
 # Ensure project root is on sys.path so "envs" imports work
@@ -45,7 +47,7 @@ def parse_args():
     # ----------------------------
     # ClearML (remote execution)
     # ----------------------------
-    p.add_argument("--use_clearml", action="store_true", help="Run training remotely via ClearML")
+    p.add_argument("--use_clearml", action="store_true", help="Enqueue training remotely via ClearML")
     p.add_argument("--project_name", type=str, default="Mentor Group - Alican/Group 1")
     p.add_argument("--task_name", type=str, default="OT2_PPO_Train")
     p.add_argument("--queue", type=str, default="default")
@@ -96,6 +98,23 @@ def round_up_to_multiple(x: int, m: int) -> int:
     return int(((x + m - 1) // m) * m)
 
 
+def _cast_like(current_value: Any, new_value: Any) -> Any:
+    """Cast new_value to the type of current_value where possible."""
+    try:
+        if isinstance(current_value, bool):
+            # ClearML might store as "true"/"false" strings
+            if isinstance(new_value, str):
+                return new_value.strip().lower() in ("1", "true", "yes", "y", "on")
+            return bool(new_value)
+        if isinstance(current_value, int):
+            return int(new_value)
+        if isinstance(current_value, float):
+            return float(new_value)
+        return new_value
+    except Exception:
+        return new_value
+
+
 def upload_artifact(name: str, filepath: str):
     """Upload an artifact to ClearML with visible diagnostics."""
     try:
@@ -121,40 +140,54 @@ def upload_artifact(name: str, filepath: str):
         print(f"[upload_artifact] FAILED {name}: {e}")
 
 
-def maybe_init_clearml(args):
+def maybe_init_clearml_and_sync_args(args):
     """
-    Initialize ClearML and (if local) enqueue the task for remote execution.
-    Important: Connect CLI args so remote run uses exactly what you launched with.
+    ClearML integration that works in BOTH contexts:
+
+    Local:
+      - create task, connect args, set docker, enqueue to queue
+      - local process terminates after execute_remotely()
+
+    Remote worker:
+      - attach to existing task (Task.current_task)
+      - connect args to 'cli_args' and READ them back to overwrite defaults,
+        because worker may not receive CLI args at all.
     """
+    from clearml import Task
+
+    running_on_worker = bool(os.environ.get("CLEARML_TASK_ID"))
+
+    # ---- Remote worker path ----
+    if running_on_worker:
+        task = Task.current_task()
+        if task is None:
+            # Fallback: init (should be rare)
+            task = Task.init(project_name=args.project_name, task_name=args.task_name)
+
+        # Connect and read back args
+        cfg = task.connect(vars(args), name="cli_args")
+        # Overwrite argparse args from cfg so defaults do not run
+        for k, v in cfg.items():
+            if hasattr(args, k):
+                setattr(args, k, _cast_like(getattr(args, k), v))
+
+        return task
+
+    # ---- Local enqueue path ----
     if not args.use_clearml:
         return None
 
-    from clearml import Task
-
-    # If running on the remote worker already, attach/init and continue training normally.
-    if os.environ.get("CLEARML_TASK_ID"):
-        task = Task.current_task()
-        if task is None:
-            task = Task.init(project_name=args.project_name, task_name=args.task_name)
-
-        # Connect args so they are visible in UI and saved with the task
-        task.connect(vars(args), name="cli_args")
-        return task
-
-    # Local machine: create task, connect args, set docker, then enqueue.
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.connect(vars(args), name="cli_args")
     task.set_base_docker(args.docker)
 
     print("[ClearML] Enqueuing task to queue:", args.queue)
     task.execute_remotely(queue_name=args.queue)
-
-    # After execute_remotely, the local process will terminate.
     return task
 
 
 class ClearMLScalarCallback(BaseCallback):
-    """Reports a few useful Scalars to ClearML."""
+    """Reports a few useful Scalars to ClearML (if task/logger exists)."""
     def __init__(self, report_every_steps: int = 2048):
         super().__init__()
         self.report_every_steps = int(report_every_steps)
@@ -203,13 +236,17 @@ class ClearMLScalarCallback(BaseCallback):
 def main():
     args = parse_args()
 
-    # Print argv early so it appears in both local and remote logs
+    # Print argv early
     print("ARGV:", sys.argv)
 
-    # ClearML remote execution hook (local enqueues and exits; remote continues)
-    _ = maybe_init_clearml(args)
+    # Critical: On ClearML agents, CLI args may not be forwarded.
+    # If CLEARML_TASK_ID is set, force ClearML mode so we attach and sync args.
+    if os.environ.get("CLEARML_TASK_ID"):
+        args.use_clearml = True
 
-    # If we are still here, we are actually running training (locally or on the worker).
+    # Attach/enqueue and (on worker) sync args from ClearML
+    _ = maybe_init_clearml_and_sync_args(args)
+
     # Auto-generate run folder name if missing
     if not args.run_name:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -220,7 +257,7 @@ def main():
     args.total_timesteps = round_up_to_multiple(args.total_timesteps, rollout)
     args.checkpoint_freq = round_up_to_multiple(args.checkpoint_freq, rollout)
 
-    # Model save folder (inside repo on worker)
+    # Model save folder
     model_root = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
     os.makedirs(model_root, exist_ok=True)
 
