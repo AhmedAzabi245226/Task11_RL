@@ -7,25 +7,25 @@ import os
 import sys
 import subprocess
 import argparse
+import shutil
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
 
-# Do not expose GPU
+# Do not expose GPU (prevents CUDA torch from trying to use CUPTI)
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-
 
 # -------------------------------------------------
 # Paths (do NOT import env/sim here)
 # -------------------------------------------------
 THIS_DIR = Path(__file__).resolve().parent          # .../Task11_RL/training
 PROJECT_ROOT = THIS_DIR.parent                      # .../Task11_RL
-REQ_FILE = PROJECT_ROOT / "requirements.txt"
 
 
 # =================================================
-# ClearML helper
+# ClearML / Worker detection
 # =================================================
 def _is_worker() -> bool:
     return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"))
@@ -42,7 +42,10 @@ def _restart_self() -> None:
 
 
 def _attach_or_get_task():
-    from clearml import Task
+    try:
+        from clearml import Task
+    except Exception:
+        return None
 
     task = Task.current_task()
     if task is None:
@@ -50,32 +53,6 @@ def _attach_or_get_task():
         if tid:
             task = Task.get_task(task_id=tid)
     return task
-
-
-def _add_requirements_to_task(task) -> None:
-    """
-    ClearML 2.0.2 does NOT support set_packages_requirements().
-    Use add_requirements() and keep it best-effort.
-    """
-    if not REQ_FILE.exists():
-        print(f"[ClearML] requirements.txt not found at: {REQ_FILE} (skipping)")
-        return
-
-    try:
-        # common signature
-        task.add_requirements(str(REQ_FILE))
-        print(f"[ClearML] Added requirements file: {REQ_FILE}")
-        return
-    except TypeError:
-        # alternative signature in some versions
-        try:
-            task.add_requirements(requirements_file=str(REQ_FILE))
-            print(f"[ClearML] Added requirements file: {REQ_FILE}")
-            return
-        except Exception as e:
-            print("[ClearML] add_requirements failed:", repr(e))
-    except Exception as e:
-        print("[ClearML] add_requirements failed:", repr(e))
 
 
 def clearml_setup_and_exit_if_local(args) -> Optional[str]:
@@ -104,8 +81,10 @@ def clearml_setup_and_exit_if_local(args) -> Optional[str]:
     task.connect(vars(args), name="cli_args")
     task.set_base_docker(args.docker)
 
-    # IMPORTANT: correct method for ClearML 2.0.2
-    _add_requirements_to_task(task)
+    # IMPORTANT:
+    # Do NOT call task.add_requirements() with requirements.txt if it contains pip options
+    # like --index-url / --extra-index-url (ClearML SDK will crash parsing them).
+    # Let the agent do its normal requirements/package analysis from the repo.
 
     print("[ClearML] Enqueuing to queue:", args.queue)
     task.execute_remotely(queue_name=args.queue)
@@ -117,14 +96,14 @@ def clearml_setup_and_exit_if_local(args) -> Optional[str]:
 # =================================================
 def ensure_cpu_torch_on_worker() -> None:
     """
-    Fix libcupti.so.12 by forcing CPU torch inside the venv before SB3 import.
+    Fix libcupti.so.12 by forcing CPU torch inside the venv BEFORE SB3 import.
     """
     if not _is_worker():
         return
 
     need_install = False
     try:
-        import torch as _t
+        import torch as _t  # noqa
         if _t.version.cuda is not None:
             need_install = True
     except Exception as e:
@@ -169,6 +148,24 @@ def ensure_pybullet_on_worker() -> None:
 
 
 # =================================================
+# Memory cleanup (helps long runs)
+# =================================================
+def _cleanup_memory(tag: str = "") -> None:
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import torch  # noqa
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    if tag:
+        print(f"[mem] cleanup done: {tag}")
+
+
+# =================================================
 # Args
 # =================================================
 def parse_args():
@@ -200,8 +197,14 @@ def parse_args():
     p.add_argument("--clip_range", type=float, default=0.2)
     p.add_argument("--ent_coef", type=float, default=0.0)
 
-    # Timesteps
+    # Timesteps & saving
     p.add_argument("--total_timesteps", type=int, default=800_000)
+    p.add_argument("--checkpoint_freq", type=int, default=102_400)
+
+    # Artifacts upload controls
+    p.add_argument("--upload_final", action="store_true", help="Upload final model to ClearML (default ON).")
+    p.add_argument("--upload_run_zip", action="store_true", help="Upload run folder zip to ClearML (default OFF).")
+    p.set_defaults(upload_final=True, upload_run_zip=False)
 
     return p.parse_args()
 
@@ -231,28 +234,64 @@ def main():
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
     from stable_baselines3.common.callbacks import BaseCallback
-
     from envs.ot2_gym_wrapper import OT2GymEnv
 
+    # -------- ClearML logging callback (Scalars) --------
     class ClearMLScalarCallback(BaseCallback):
-        def __init__(self, report_every: int):
+        """
+        Logs:
+          - rollout/ep_rew_mean_est (rolling mean over last N episodes)
+          - rollout/success_rate_est (episodes with info["is_success"])
+          - time/timesteps
+        """
+        def __init__(self, report_every_steps: int, window: int = 50):
             super().__init__()
-            self.report_every = int(report_every)
+            self.report_every_steps = int(report_every_steps)
+            self.window = int(window)
             self._logger = None
+
+            self._ep_return = 0.0
+            self._ep_returns: list[float] = []
+            self._episodes = 0
+            self._successes = 0
 
         def _on_training_start(self) -> None:
             try:
-                from clearml import Task
-                t = Task.current_task()
-                self._logger = t.get_logger() if t else None
+                task = _attach_or_get_task()
+                self._logger = task.get_logger() if task else None
+                print("[ClearML] scalar logger active:", bool(self._logger))
             except Exception:
                 self._logger = None
+                print("[ClearML] scalar logger active: False")
 
         def _on_step(self) -> bool:
-            if self._logger and (self.num_timesteps % self.report_every == 0):
-                self._logger.report_scalar("time", "timesteps", self.num_timesteps, iteration=self.num_timesteps)
+            # VecEnv has shape (n_envs,) even when n_envs=1
+            reward = float(self.locals["rewards"][0])
+            self._ep_return += reward
+
+            done = bool(self.locals["dones"][0])
+            info = self.locals["infos"][0]
+
+            if done:
+                self._episodes += 1
+                self._ep_returns.append(self._ep_return)
+                if bool(info.get("is_success", False)):
+                    self._successes += 1
+                self._ep_return = 0.0
+
+            if self._logger and (self.num_timesteps % self.report_every_steps == 0):
+                recent = self._ep_returns[-self.window:] if self._ep_returns else []
+                ep_rew_mean = (sum(recent) / len(recent)) if recent else 0.0
+                success_rate = (self._successes / self._episodes) if self._episodes > 0 else 0.0
+                it = int(self.num_timesteps)
+
+                self._logger.report_scalar("rollout", "ep_rew_mean_est", ep_rew_mean, iteration=it)
+                self._logger.report_scalar("rollout", "success_rate_est", success_rate, iteration=it)
+                self._logger.report_scalar("time", "timesteps", it, iteration=it)
+
             return True
 
+    # -------- VecEnv --------
     def make_env():
         def _make():
             env = OT2GymEnv(
@@ -288,15 +327,82 @@ def main():
         device="cpu",  # hard force CPU
     )
 
-    cb = ClearMLScalarCallback(report_every=args.n_steps)
-    model.learn(total_timesteps=int(args.total_timesteps), callback=cb)
+    cb = ClearMLScalarCallback(report_every_steps=args.n_steps, window=50)
 
-    final_path = model_dir / "ppo_ot2_final"
-    model.save(final_path)
-    env.close()
+    # -------- Training loop with optional checkpoints --------
+    total = int(args.total_timesteps)
+    ckpt_freq = int(args.checkpoint_freq) if int(args.checkpoint_freq) > 0 else total
+
+    trained = 0
+    while trained < total:
+        this_chunk = min(ckpt_freq, total - trained)
+
+        model.learn(
+            total_timesteps=this_chunk,
+            callback=cb,
+            progress_bar=not _is_worker(),  # progress bar locally only
+            reset_num_timesteps=False,
+        )
+        trained += this_chunk
+
+        # Save checkpoint (local filesystem)
+        ckpt_base = model_dir / f"ppo_ot2_{trained}_steps"
+        model.save(str(ckpt_base))
+        _cleanup_memory(tag=f"after save {trained}")
+
+    # -------- Final save --------
+    final_base = model_dir / "ppo_ot2_final"
+    model.save(str(final_base))
+    final_zip = str(final_base) + ".zip"
+
+    # Close env BEFORE uploads (most stable with pybullet)
+    try:
+        env.close()
+    except Exception:
+        pass
+    _cleanup_memory(tag="after env.close()")
 
     print("Training finished successfully.")
-    print("Saved to:", final_path)
+    print("Saved to:", final_base)
+
+    # -------- Upload artifacts to ClearML (Artifacts tab) --------
+    task = _attach_or_get_task()
+    if task is not None:
+        # Upload final model
+        if args.upload_final and os.path.exists(final_zip):
+            try:
+                print("[ClearML] Uploading artifact: ppo_final_model ->", final_zip)
+                task.upload_artifact(
+                    name="ppo_final_model",
+                    artifact_object=final_zip,
+                    wait_on_upload=True,
+                )
+                try:
+                    task.flush(wait_for_uploads=True)
+                except Exception:
+                    pass
+            except Exception as e:
+                print("[ClearML] final model upload failed:", repr(e))
+
+        # Optional: zip the run folder and upload
+        if args.upload_run_zip:
+            try:
+                zip_base = str(model_dir)  # creates <model_dir>.zip
+                zip_path = shutil.make_archive(base_name=zip_base, format="zip", root_dir=str(model_dir))
+                print("[ClearML] Uploading artifact: run_folder_zip ->", zip_path)
+                task.upload_artifact(
+                    name="run_folder_zip",
+                    artifact_object=zip_path,
+                    wait_on_upload=True,
+                )
+                try:
+                    task.flush(wait_for_uploads=True)
+                except Exception:
+                    pass
+            except Exception as e:
+                print("[ClearML] run folder zip upload failed:", repr(e))
+
+    _cleanup_memory(tag="final")
 
 
 if __name__ == "__main__":
