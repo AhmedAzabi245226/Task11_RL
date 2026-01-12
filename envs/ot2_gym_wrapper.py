@@ -26,6 +26,13 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
+# IMPORTANT: we will use pybullet ONLY for cleanup safety
+try:
+    import pybullet as p  # type: ignore
+except Exception:
+    p = None  # pybullet might not import in some contexts; close() will handle
+
+
 # -------------------------------------------------
 # Task 9 path setup (portable: Task 9 is inside this repo)
 # -------------------------------------------------
@@ -70,6 +77,7 @@ class OT2GymEnv(gym.Env):
         self._cwd_set = False
         self._set_cwd_for_assets()
 
+        # Create simulation (PyBullet lives inside Simulation)
         self.sim = Simulation(num_agents=1, render=render, rgb_array=False)
 
         # Action: vx, vy, vz, drop (drop unused but kept for compatibility)
@@ -163,7 +171,10 @@ class OT2GymEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
+        # Important: ensure Simulation resets cleanly each episode
+        # (If Simulation.reset leaks Bullet state, close()/recreate is heavier; we keep it simple here.)
         self.sim.reset(num_agents=1)
+
         self.step_count = 0
 
         # New random target each episode (unless caller passes options["target"])
@@ -206,19 +217,15 @@ class OT2GymEnv(gym.Env):
         # -------------------------
         # Reward shaping
         # -------------------------
-        # Progress reward: positive when moving closer
         progress = (self.prev_distance - distance) if self.prev_distance is not None else 0.0
         reward = 10.0 * float(progress)
 
-        # Dense distance shaping
         reward -= 0.2 * distance
-
-        # Small action penalty
         reward -= 0.01 * float(np.linalg.norm(action[0:3]))
 
-        # Boundary penalty: discourage saturating near workspace edges/corners
+        # Boundary penalty
         x, y, z = float(pipette[0]), float(pipette[1]), float(pipette[2])
-        edge_margin = 0.01  # 1 cm band near edges
+        edge_margin = 0.01
         edge_pen = 0.0
         if x < self.X_MIN + edge_margin or x > self.X_MAX - edge_margin:
             edge_pen += 1.0
@@ -258,13 +265,48 @@ class OT2GymEnv(gym.Env):
         return obs, float(reward), terminated, truncated, info
 
     def render(self):
-        # Rendering handled by PyBullet in sim_class; nothing to return for Gymnasium here.
         return None
 
     def close(self):
+        """
+        Critical: aggressively release PyBullet native memory.
+
+        Why:
+        - Even if Simulation.close() exists, long ClearML runs often crash with std::bad_alloc
+          when Bullet clients are not disconnected cleanly.
+        """
+        # 1) Try sim.close()
         try:
-            self.sim.close()
+            if hasattr(self, "sim") and self.sim is not None:
+                try:
+                    self.sim.close()
+                except Exception:
+                    pass
         finally:
-            if self._old_cwd is not None:
-                os.chdir(self._old_cwd)
+            # 2) Hard disconnect ALL Bullet clients (safe even if none exist)
+            try:
+                if p is not None:
+                    # Disconnect any active clients
+                    # getConnectionInfo works with physicsClientId; we iterate a small range defensively
+                    for cid in range(0, 32):
+                        try:
+                            info = p.getConnectionInfo(physicsClientId=cid)
+                            if info and info.get("isConnected", 0) == 1:
+                                p.disconnect(physicsClientId=cid)
+                        except Exception:
+                            pass
+                    # Final fallback disconnect (no id)
+                    try:
+                        p.disconnect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # 3) Restore cwd
+            try:
+                if getattr(self, "_old_cwd", None) is not None:
+                    os.chdir(self._old_cwd)
+            except Exception:
+                pass
             self._cwd_set = False
