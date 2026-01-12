@@ -9,7 +9,7 @@ Key fixes:
 - Worker receives args: args are connected to ClearML and synced on worker.
 - Resume supports ClearML artifacts (authenticated), avoiding 401 from raw URL downloads.
 - Resume_path works for repo-relative paths: tries as-is AND PROJECT_ROOT/<resume_path>.
-- Upload checkpoints + final model + run folder zip to ClearML Artifacts (with diagnostics).
+- Upload checkpoints + final model + run folder zip to ClearML Artifacts (blocking upload + flush).
 - Report scalars to ClearML.
 - Optional env recreation each chunk to reduce PyBullet memory creep.
 
@@ -24,6 +24,7 @@ import os
 import sys
 import argparse
 import shutil
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -80,22 +81,12 @@ def parse_args():
     # Resume / staged training
     p.add_argument("--resume_path", type=str, default="", help="Path to PPO .zip on WORKER or repo-relative (NOT a URL).")
     p.add_argument("--resume_task_id", type=str, default="", help="ClearML task id to pull resume model from.")
-    p.add_argument(
-        "--resume_artifact",
-        type=str,
-        default="ppo_final_model",
-        help="Artifact name in resume task (default: ppo_final_model).",
-    )
-    p.add_argument(
-        "--reset_timesteps",
-        action="store_true",
-        help="Reset SB3 timesteps counter at first learn() call (default: continue).",
-    )
-    p.add_argument(
-        "--recreate_env_each_chunk",
-        action="store_true",
-        help="Close/recreate env between chunks (helps avoid long-run PyBullet memory creep).",
-    )
+    p.add_argument("--resume_artifact", type=str, default="ppo_final_model",
+                   help="Artifact name in resume task (default: ppo_final_model).")
+    p.add_argument("--reset_timesteps", action="store_true",
+                   help="Reset SB3 timesteps counter at first learn() call (default: continue).")
+    p.add_argument("--recreate_env_each_chunk", action="store_true",
+                   help="Close/recreate env between chunks (helps avoid long-run PyBullet memory creep).")
 
     return p.parse_args()
 
@@ -126,7 +117,7 @@ def _cast_like(current_value: Any, new_value: Any) -> Any:
 # ClearML helpers (robust)
 # ----------------------------
 def _is_worker() -> bool:
-    # Some agents set CLEARML_WORKER_ID reliably even when CLEARML_TASK_ID is not visible very early
+    # Some agents set CLEARML_WORKER_ID reliably
     return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"))
 
 
@@ -158,17 +149,15 @@ def clearml_setup_and_sync_args(args) -> Optional[str]:
         current_task_id (str) on worker, else None.
     """
     if not args.use_clearml and not _is_worker():
-        return None  # no clearml at all
+        return None
 
     from clearml import Task
 
     if _is_worker():
         args.use_clearml = True  # ensure enabled on worker
 
-        # IMPORTANT: never enqueue or Task.init() on worker
         task = _get_task()
         if task is None:
-            # last-resort attach by id, still no Task.init
             tid = os.environ.get("CLEARML_TASK_ID")
             if not tid:
                 raise RuntimeError("Worker detected but CLEARML_TASK_ID missing; cannot attach task.")
@@ -192,8 +181,29 @@ def clearml_setup_and_sync_args(args) -> Optional[str]:
     raise SystemExit(0)
 
 
+def _cleanup_memory(tag: str = ""):
+    """Best-effort cleanup between chunks to reduce native/GPU fragmentation."""
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    if tag:
+        print(f"[mem] cleanup done: {tag}")
+
+
 def upload_artifact(name: str, filepath: str):
-    """Upload an artifact to ClearML with visible diagnostics."""
+    """
+    Upload an artifact to ClearML with visible diagnostics.
+
+    Stability: uses blocking upload + flush to reduce crash likelihood
+    around artifact handling (some environments crash on background upload threads).
+    """
     try:
         task = _get_task()
         if task is None:
@@ -208,7 +218,16 @@ def upload_artifact(name: str, filepath: str):
 
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
         print(f"[upload_artifact] Uploading {name}: {filepath} ({size_mb:.2f} MB)")
-        task.upload_artifact(name=name, artifact_object=filepath)
+
+        # Blocking upload + flush
+        task.upload_artifact(name=name, artifact_object=filepath, wait_on_upload=True)
+        try:
+            task.flush(wait_for_uploads=True)
+        except Exception:
+            pass
+
+        _cleanup_memory(tag=f"after upload {name}")
+
     except Exception as e:
         print(f"[upload_artifact] FAILED {name}: {e}")
 
@@ -229,22 +248,18 @@ def resolve_resume_local_path(args) -> str:
         )
 
     if args.resume_path:
-        # Diagnostics help if worker CWD is not repo root
         print("[resume] CWD:", os.getcwd())
         print("[resume] PROJECT_ROOT:", str(PROJECT_ROOT))
         print("[resume] resume_path (raw):", args.resume_path)
 
-        # 1) try as provided
         if os.path.exists(args.resume_path):
             return args.resume_path
 
-        # 2) try relative to repo root
         candidate = os.path.join(str(PROJECT_ROOT), args.resume_path)
         print("[resume] trying PROJECT_ROOT-resolved:", candidate)
         if os.path.exists(candidate):
             return candidate
 
-        # optional: list folder for debugging
         folder = os.path.join(str(PROJECT_ROOT), os.path.dirname(args.resume_path))
         if os.path.isdir(folder):
             try:
@@ -273,7 +288,7 @@ def resolve_resume_local_path(args) -> str:
 # Scalars
 # ----------------------------
 class ClearMLScalarCallback(BaseCallback):
-    """Reports a few useful Scalars to ClearML (if logger exists)."""
+    """Reports a few useful scalars to ClearML (if logger exists)."""
     def __init__(self, report_every_steps: int = 2048):
         super().__init__()
         self.report_every_steps = int(report_every_steps)
@@ -340,23 +355,18 @@ def make_env(args) -> OT2GymEnv:
 def main():
     args = parse_args()
 
-    # Always print argv
     print("ARGV:", sys.argv)
 
-    # ClearML setup: local enqueues+exits, worker syncs args and continues
     current_task_id = clearml_setup_and_sync_args(args)
 
-    # Auto run name
     if not args.run_name:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.run_name = f"ppo_ot2_{stamp}"
 
-    # Align to rollout
     rollout = int(args.n_steps)
     args.total_timesteps = round_up_to_multiple(args.total_timesteps, rollout)
     args.checkpoint_freq = round_up_to_multiple(args.checkpoint_freq, rollout)
 
-    # Save folder
     model_root = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
     os.makedirs(model_root, exist_ok=True)
 
@@ -408,7 +418,7 @@ def main():
     cb = ClearMLScalarCallback(report_every_steps=args.n_steps)
 
     trained = 0
-    use_progress_bar = not _is_worker()  # keep worker logs cleaner
+    use_progress_bar = not _is_worker()
 
     while trained < total:
         this_chunk = min(chunk, total - trained)
@@ -419,7 +429,6 @@ def main():
             reset_num_timesteps=bool(args.reset_timesteps),
             callback=cb,
         )
-        # Only allow resetting once
         args.reset_timesteps = False
 
         trained += this_chunk
@@ -432,13 +441,19 @@ def main():
         print("Checkpoint exists?", os.path.exists(ckpt_zip), ckpt_zip)
         upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
 
+        # Strong cleanup point
+        _cleanup_memory(tag=f"after checkpoint {trained}")
+
         if args.recreate_env_each_chunk:
             try:
                 env.close()
             except Exception:
                 pass
+            # recreate env after hard close/disconnect (wrapper handles PyBullet)
             env = make_env(args)
             model.set_env(env)
+
+        _cleanup_memory(tag=f"after env recreate {trained}")
 
     final_base = os.path.join(model_root, "ppo_ot2_final")
     final_zip = f"{final_base}.zip"
@@ -448,7 +463,6 @@ def main():
     print("Final model exists?", os.path.exists(final_zip), final_zip)
     upload_artifact(name="ppo_final_model", filepath=final_zip)
 
-    # Zip entire run folder
     try:
         zip_base = os.path.join(str(PROJECT_ROOT), "models", args.run_name)
         zip_file = shutil.make_archive(base_name=zip_base, format="zip", root_dir=model_root)
@@ -457,7 +471,12 @@ def main():
     except Exception as e:
         print("[zip] FAILED:", e)
 
-    env.close()
+    try:
+        env.close()
+    except Exception:
+        pass
+
+    _cleanup_memory(tag="final")
 
     print("\nTraining finished successfully.")
     print("All checkpoints saved under:", model_root)

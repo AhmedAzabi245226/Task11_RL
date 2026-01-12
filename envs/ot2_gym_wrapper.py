@@ -13,6 +13,10 @@ Key design:
 - Truncation: max_steps
 
 Compatible with Stable Baselines 3.
+
+Critical stability fix:
+- close() aggressively disconnects PyBullet clients to prevent native memory creep
+  leading to std::bad_alloc / exit code 139.
 """
 
 from __future__ import annotations
@@ -26,11 +30,11 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# IMPORTANT: we will use pybullet ONLY for cleanup safety
+# IMPORTANT: pybullet is used ONLY for cleanup safety
 try:
     import pybullet as p  # type: ignore
 except Exception:
-    p = None  # pybullet might not import in some contexts; close() will handle
+    p = None  # close() will handle
 
 
 # -------------------------------------------------
@@ -49,7 +53,6 @@ if not TASK9_PATH.exists():
         "      sim_class.py, URDFs, meshes/, textures/\n"
     )
 
-# Make Task 9 importable (for sim_class.py)
 if str(TASK9_PATH) not in sys.path:
     sys.path.insert(0, str(TASK9_PATH))
 
@@ -72,7 +75,6 @@ class OT2GymEnv(gym.Env):
     ):
         super().__init__()
 
-        # Task 9 uses relative asset paths -> ensure cwd points to Task 9 during sim lifetime
         self._old_cwd = os.getcwd()
         self._cwd_set = False
         self._set_cwd_for_assets()
@@ -80,7 +82,7 @@ class OT2GymEnv(gym.Env):
         # Create simulation (PyBullet lives inside Simulation)
         self.sim = Simulation(num_agents=1, render=render, rgb_array=False)
 
-        # Action: vx, vy, vz, drop (drop unused but kept for compatibility)
+        # Action: vx, vy, vz, drop (drop unused)
         self.action_space = spaces.Box(
             low=np.array([-0.3, -0.3, -0.3, 0.0], dtype=np.float32),
             high=np.array([0.3, 0.3, 0.3, 1.0], dtype=np.float32),
@@ -112,7 +114,6 @@ class OT2GymEnv(gym.Env):
         self.rng = np.random.default_rng(seed)
         self.target = np.zeros(3, dtype=np.float32)
 
-        # For progress reward shaping
         self.prev_distance: Optional[float] = None
 
         if self.debug:
@@ -137,7 +138,7 @@ class OT2GymEnv(gym.Env):
         x = self.rng.uniform(self.X_MIN + self.margin, self.X_MAX - self.margin)
         y = self.rng.uniform(self.Y_MIN + self.margin, self.Y_MAX - self.margin)
 
-        # Conservative global Z floor (highest observed z_min across corners)
+        # Conservative global Z floor
         Z_SAFE_MIN = 0.1695
         z_low = max(self.Z_MIN + self.margin, Z_SAFE_MIN + self.margin)
         z_high = self.Z_MAX - self.margin
@@ -171,13 +172,9 @@ class OT2GymEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
-        # Important: ensure Simulation resets cleanly each episode
-        # (If Simulation.reset leaks Bullet state, close()/recreate is heavier; we keep it simple here.)
         self.sim.reset(num_agents=1)
-
         self.step_count = 0
 
-        # New random target each episode (unless caller passes options["target"])
         if options and "target" in options and options["target"] is not None:
             self.target = np.array(options["target"], dtype=np.float32)
         else:
@@ -204,7 +201,7 @@ class OT2GymEnv(gym.Env):
 
         action = np.array(action, dtype=np.float32)
         action[0:3] = np.clip(action[0:3], -0.3, 0.3)
-        action[3] = 0.0  # drop not used
+        action[3] = 0.0  # drop unused
 
         # Apply action for N sim steps (action repeat)
         self.sim.run([action.tolist()], num_steps=self.action_repeat)
@@ -214,12 +211,9 @@ class OT2GymEnv(gym.Env):
         error_vec = self.target - pipette
         distance = float(np.linalg.norm(error_vec))
 
-        # -------------------------
         # Reward shaping
-        # -------------------------
         progress = (self.prev_distance - distance) if self.prev_distance is not None else 0.0
         reward = 10.0 * float(progress)
-
         reward -= 0.2 * distance
         reward -= 0.01 * float(np.linalg.norm(action[0:3]))
 
@@ -271,9 +265,8 @@ class OT2GymEnv(gym.Env):
         """
         Critical: aggressively release PyBullet native memory.
 
-        Why:
-        - Even if Simulation.close() exists, long ClearML runs often crash with std::bad_alloc
-          when Bullet clients are not disconnected cleanly.
+        This prevents long ClearML runs from crashing with std::bad_alloc / exit code 139
+        when Bullet clients are not disconnected cleanly.
         """
         # 1) Try sim.close()
         try:
@@ -283,11 +276,10 @@ class OT2GymEnv(gym.Env):
                 except Exception:
                     pass
         finally:
-            # 2) Hard disconnect ALL Bullet clients (safe even if none exist)
+            # 2) Hard disconnect Bullet clients (safe if none exist)
             try:
                 if p is not None:
-                    # Disconnect any active clients
-                    # getConnectionInfo works with physicsClientId; we iterate a small range defensively
+                    # Try explicit client IDs defensively
                     for cid in range(0, 32):
                         try:
                             info = p.getConnectionInfo(physicsClientId=cid)
@@ -295,7 +287,7 @@ class OT2GymEnv(gym.Env):
                                 p.disconnect(physicsClientId=cid)
                         except Exception:
                             pass
-                    # Final fallback disconnect (no id)
+                    # Final fallback
                     try:
                         p.disconnect()
                     except Exception:
