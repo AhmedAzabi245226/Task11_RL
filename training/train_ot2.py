@@ -15,28 +15,36 @@ from typing import Optional
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
 
-
 # -------------------------------------------------
 # Paths (do NOT import env/sim here)
 # -------------------------------------------------
 THIS_DIR = Path(__file__).resolve().parent          # .../Task11_RL/training
 PROJECT_ROOT = THIS_DIR.parent                      # .../Task11_RL
+REQ_FILE = PROJECT_ROOT / "requirements.txt"
 
 
 # =================================================
-# ClearML helper
+# Helpers
 # =================================================
 def _is_worker() -> bool:
     return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"))
 
 
+def _pip_install(cmd: list[str]) -> None:
+    print("[pip]", " ".join(cmd))
+    subprocess.check_call(cmd)
+
+
+# =================================================
+# ClearML: enqueue locally, attach on worker
+# =================================================
 def clearml_setup_and_exit_if_local(args) -> Optional[str]:
     """
     If --use_clearml:
-      - Local machine: create task -> enqueue -> EXIT (no env imports, no pybullet needed locally)
+      - Local: create task -> set docker -> set requirements -> enqueue -> EXIT
       - Worker: attach and continue
     If not --use_clearml:
-      - Run locally (then you DO need pybullet locally)
+      - Run locally (then you need local deps)
     """
     if not args.use_clearml and not _is_worker():
         return None
@@ -50,49 +58,52 @@ def clearml_setup_and_exit_if_local(args) -> Optional[str]:
             if tid:
                 task = Task.get_task(task_id=tid)
         if task:
+            # Connect args (worker side sync)
             task.connect(vars(args), name="cli_args")
             print("[ClearML] Worker attached:", task.id)
             return task.id
         return None
 
-    # Local enqueue path
+    # -------- Local enqueue path --------
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.connect(vars(args), name="cli_args")
     task.set_base_docker(args.docker)
+
+    # CRITICAL: force requirements from repo
+    if REQ_FILE.exists():
+        task.set_packages_requirements(requirements_file=str(REQ_FILE))
+        print("[ClearML] Using requirements file:", str(REQ_FILE))
+    else:
+        print("[ClearML] WARNING: requirements.txt not found at:", str(REQ_FILE))
+
     print("[ClearML] Enqueuing to queue:", args.queue)
     task.execute_remotely(queue_name=args.queue)
     raise SystemExit(0)
 
 
 # =================================================
-# Runtime dependency enforcement (WORKER ONLY)
+# Worker-only dependency enforcement
 # =================================================
-def _pip_install(cmd: list[str]) -> None:
-    print("[pip]", " ".join(cmd))
-    subprocess.check_call(cmd)
-
-
 def ensure_cpu_torch_on_worker() -> None:
     """
-    Fix libcupti.so.12 by forcing CPU torch inside the venv before SB3 import.
-    Uses CPU index-url ONLY to prevent pulling CUDA wheels.
+    Fix libcupti.so.12 by forcing CPU torch inside the worker venv BEFORE SB3 import.
     """
     if not _is_worker():
         return
 
-    # If torch import fails OR cuda build is detected -> install cpu torch and restart
     need_install = False
     try:
         import torch  # noqa: F401
         import torch as _t
         if _t.version.cuda is not None:
+            print("[torch-check] CUDA build detected:", _t.__version__)
             need_install = True
     except Exception as e:
-        # Common when CUDA torch is present but CUpti is missing
         print("[torch-check] torch import failed:", repr(e))
         need_install = True
 
     if not need_install:
+        print("[torch-check] torch OK (CPU build).")
         return
 
     print("[FIX] Installing CPU-only torch to avoid CUDA/CUPTI issues...")
@@ -109,8 +120,7 @@ def ensure_cpu_torch_on_worker() -> None:
 
 def ensure_pybullet_on_worker() -> None:
     """
-    Your worker failed with: ModuleNotFoundError: No module named 'pybullet'
-    This ensures pybullet (and pybullet_data) exist on the worker.
+    Fix: ModuleNotFoundError: No module named 'pybullet' / 'pybullet_data'
     """
     if not _is_worker():
         return
@@ -118,6 +128,7 @@ def ensure_pybullet_on_worker() -> None:
     try:
         import pybullet  # noqa: F401
         import pybullet_data  # noqa: F401
+        print("[pybullet-check] pybullet OK.")
         return
     except Exception as e:
         print("[pybullet-check] missing:", repr(e))
@@ -177,29 +188,28 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Make sure we can import project code AFTER enqueue decision
+    # Always make project importable (after enqueue decision, this is harmless)
     os.chdir(str(PROJECT_ROOT))
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
 
-    # 1) If local + --use_clearml: enqueue and exit BEFORE importing env/sb3
+    # 1) Local enqueue path exits here (no SB3/pybullet imports locally)
     clearml_setup_and_exit_if_local(args)
 
-    # 2) Worker only: fix torch first (prevents libcupti crash)
+    # 2) Worker: fix torch first (prevents libcupti crash)
     ensure_cpu_torch_on_worker()
 
-    # 3) Worker only: ensure pybullet exists (prevents ModuleNotFoundError)
+    # 3) Worker: ensure pybullet exists (prevents ModuleNotFoundError)
     ensure_pybullet_on_worker()
 
-    # 4) Now it is safe to import heavy deps
+    # 4) Safe imports now
     from stable_baselines3 import PPO
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
     from stable_baselines3.common.callbacks import BaseCallback
-
     from envs.ot2_gym_wrapper import OT2GymEnv
 
-    # Optional: ClearML scalar logging
+    # ClearML scalar logging (optional)
     class ClearMLScalarCallback(BaseCallback):
         def __init__(self, report_every: int):
             super().__init__()
