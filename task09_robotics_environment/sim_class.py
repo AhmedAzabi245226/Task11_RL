@@ -1,4 +1,9 @@
-import pybullet as p
+import os
+
+p = None
+if os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"):
+    import pybullet as p
+
 import time
 import pybullet_data
 import math
