@@ -1,40 +1,18 @@
 from __future__ import annotations
 
 # =================================================
-# CRITICAL FIX — MUST BE AT VERY TOP (before SB3)
+# ABSOLUTE FIRST LINES — NO CUDA EVER
 # =================================================
 import os
-import sys
-import subprocess
-
-# Disable GPU visibility immediately
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-# If running on ClearML worker, force CPU-only torch
-if "CLEARML_TASK_ID" in os.environ or "CLEARML_WORKER_ID" in os.environ:
-    try:
-        import torch  # noqa
-        if torch.version.cuda is not None:
-            print("[FIX] CUDA torch detected. Reinstalling CPU-only torch...")
-            subprocess.check_call([
-                sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                "torch==2.4.1+cpu",
-                "--extra-index-url", "https://download.pytorch.org/whl/cpu"
-            ])
-            print("[FIX] CPU torch installed. Restarting process...")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-    except Exception:
-        pass
-
 # =================================================
-# NORMAL IMPORTS (SAFE NOW)
+# STANDARD IMPORTS
 # =================================================
+import sys
 import argparse
-import shutil
-import gc
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
 
 # -------------------------------------------------
 # Force correct project root
@@ -44,6 +22,9 @@ PROJECT_ROOT = THIS_DIR.parent
 os.chdir(str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# =================================================
+# THIRD-PARTY (SAFE NOW)
+# =================================================
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
@@ -51,7 +32,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from envs.ot2_gym_wrapper import OT2GymEnv
 
 # =================================================
-# ARGS
+# ARGUMENTS
 # =================================================
 def parse_args():
     p = argparse.ArgumentParser()
@@ -59,9 +40,11 @@ def parse_args():
     # ClearML
     p.add_argument("--use_clearml", action="store_true")
     p.add_argument("--project_name", type=str, default="Mentor Group - Alican/Group 1")
-    p.add_argument("--task_name", type=str, default="OT2_PPO_Train")
+    p.add_argument("--task_name", type=str, default="OT2_STAGE1_CPU")
     p.add_argument("--queue", type=str, default="default")
-    p.add_argument("--docker", type=str, default="deanis/2023y2b-rl:latest")
+
+    # 🚨 CRITICAL FIX — CPU-ONLY CONTAINER
+    p.add_argument("--docker", type=str, default="python:3.10-slim")
 
     # Run
     p.add_argument("--run_name", type=str, default="")
@@ -84,13 +67,12 @@ def parse_args():
 
     # Timesteps
     p.add_argument("--total_timesteps", type=int, default=800_000)
-    p.add_argument("--checkpoint_freq", type=int, default=102_400)
 
     return p.parse_args()
 
 
 # =================================================
-# ClearML helpers
+# CLEARML SETUP
 # =================================================
 def _is_worker():
     return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"))
@@ -98,7 +80,7 @@ def _is_worker():
 
 def clearml_setup(args):
     if not args.use_clearml and not _is_worker():
-        return None
+        return
 
     from clearml import Task
 
@@ -106,20 +88,22 @@ def clearml_setup(args):
         task = Task.current_task()
         task.connect(vars(args), name="cli_args")
         print("[ClearML] Worker attached:", task.id)
-        return task.id
+        return
 
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.connect(vars(args), name="cli_args")
     task.set_base_docker(args.docker)
+
+    print("[ClearML] Enqueuing to queue:", args.queue)
     task.execute_remotely(queue_name=args.queue)
     raise SystemExit(0)
 
 
 # =================================================
-# Callbacks
+# CALLBACK
 # =================================================
 class ClearMLScalarCallback(BaseCallback):
-    def __init__(self, report_every=2048):
+    def __init__(self, report_every: int):
         super().__init__()
         self.report_every = report_every
         self.logger = None
@@ -131,14 +115,19 @@ class ClearMLScalarCallback(BaseCallback):
         except Exception:
             self.logger = None
 
-    def _on_step(self):
+    def _on_step(self) -> bool:
         if self.logger and self.num_timesteps % self.report_every == 0:
-            self.logger.report_scalar("time", "timesteps", self.num_timesteps, self.num_timesteps)
+            self.logger.report_scalar(
+                title="time",
+                series="timesteps",
+                value=self.num_timesteps,
+                iteration=self.num_timesteps,
+            )
         return True
 
 
 # =================================================
-# VecEnv
+# ENV FACTORY
 # =================================================
 def make_env(args):
     def _make():
@@ -180,12 +169,12 @@ def main():
         gamma=args.gamma,
         clip_range=args.clip_range,
         ent_coef=args.ent_coef,
-        device="cpu",   # EXTRA SAFETY
+        device="cpu",  # HARD CPU LOCK
     )
 
-    cb = ClearMLScalarCallback(args.n_steps)
+    callback = ClearMLScalarCallback(args.n_steps)
 
-    model.learn(total_timesteps=args.total_timesteps, callback=cb)
+    model.learn(total_timesteps=args.total_timesteps, callback=callback)
 
     final_path = model_dir / "ppo_ot2_final"
     model.save(final_path)
