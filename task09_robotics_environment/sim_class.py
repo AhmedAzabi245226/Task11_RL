@@ -1,15 +1,18 @@
 import os
-
-p = None
-if os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"):
-    import pybullet as p
-
 import time
-import pybullet_data
 import math
 import logging
-import os
 import random
+
+# -------------------------------------------------
+# Bullet imports (ONLY on ClearML worker / Linux)
+# -------------------------------------------------
+p = None
+pybullet_data = None
+
+if os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"):
+    import pybullet as p
+    import pybullet_data
 
 #logging.basicConfig(level=logging.INFO)
 
