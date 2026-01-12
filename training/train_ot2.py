@@ -5,6 +5,7 @@ PPO training for OT2GymEnv with robust ClearML remote execution support.
 
 Key fixes:
 - No ClearML recursion: local enqueues + exits; worker never enqueues and never Task.init() again.
+- Worker detection is robust: checks CLEARML_TASK_ID OR CLEARML_WORKER_ID.
 - Worker receives args: args are connected to ClearML and synced on worker.
 - Resume supports ClearML artifacts (authenticated), avoiding 401 from raw URL downloads.
 - Resume_path works for repo-relative paths: tries as-is AND PROJECT_ROOT/<resume_path>.
@@ -15,32 +16,6 @@ Key fixes:
 Resume options (priority order):
 1) --resume_path <path_on_worker_or_repo_relative>     (NOT a URL; must exist on worker)
 2) --resume_task_id <stage1_task_id> --resume_artifact ppo_final_model
-
-Examples:
-
-Stage 1:
-  python training\\train_ot2.py --use_clearml --queue default ^
-    --project_name "Mentor Group - Alican/Group 1" ^
-    --task_name "OT2_STAGE1_T03" ^
-    --run_name ot2_stage1_t03 ^
-    --success_threshold 0.03 ^
-    --total_timesteps 300000 ^
-    --checkpoint_freq 102400 ^
-    --n_steps 512 --batch_size 64 --n_epochs 5 ^
-    --recreate_env_each_chunk
-
-Stage 2 (resume from Stage 1 artifact):
-  python training\\train_ot2.py --use_clearml --queue default ^
-    --project_name "Mentor Group - Alican/Group 1" ^
-    --task_name "OT2_STAGE2_T01" ^
-    --run_name ot2_stage2_t01 ^
-    --success_threshold 0.01 ^
-    --total_timesteps 700000 ^
-    --checkpoint_freq 102400 ^
-    --n_steps 512 --batch_size 64 --n_epochs 5 ^
-    --resume_task_id <STAGE1_TASK_ID> ^
-    --resume_artifact ppo_final_model ^
-    --recreate_env_each_chunk
 """
 
 from __future__ import annotations
@@ -148,16 +123,35 @@ def _cast_like(current_value: Any, new_value: Any) -> Any:
 
 
 # ----------------------------
-# ClearML
+# ClearML helpers (robust)
 # ----------------------------
 def _is_worker() -> bool:
-    return bool(os.environ.get("CLEARML_TASK_ID"))
+    # Some agents set CLEARML_WORKER_ID reliably even when CLEARML_TASK_ID is not visible very early
+    return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"))
+
+
+def _get_task():
+    """
+    Robustly get the running ClearML task.
+    - Prefer Task.current_task()
+    - Fall back to Task.get_task(task_id=CLEARML_TASK_ID) if needed
+    """
+    try:
+        from clearml import Task
+        t = Task.current_task()
+        if t is None:
+            tid = os.environ.get("CLEARML_TASK_ID")
+            if tid:
+                t = Task.get_task(task_id=tid)
+        return t
+    except Exception:
+        return None
 
 
 def clearml_setup_and_sync_args(args) -> Optional[str]:
     """
     Prevent recursion:
-    - Worker (CLEARML_TASK_ID set): attach to current task and sync args from ClearML.
+    - Worker: attach to current task and sync args from ClearML.
     - Local + --use_clearml: create task, connect args, enqueue, then EXIT immediately.
 
     Returns:
@@ -169,18 +163,22 @@ def clearml_setup_and_sync_args(args) -> Optional[str]:
     from clearml import Task
 
     if _is_worker():
+        args.use_clearml = True  # ensure enabled on worker
+
         # IMPORTANT: never enqueue or Task.init() on worker
-        task = Task.current_task()
+        task = _get_task()
         if task is None:
-            # If agent didn't set it properly, attach by id (still no Task.init)
-            task = Task.get_task(task_id=os.environ["CLEARML_TASK_ID"])
+            # last-resort attach by id, still no Task.init
+            tid = os.environ.get("CLEARML_TASK_ID")
+            if not tid:
+                raise RuntimeError("Worker detected but CLEARML_TASK_ID missing; cannot attach task.")
+            task = Task.get_task(task_id=tid)
 
         cfg = task.connect(vars(args), name="cli_args")
         for k, v in cfg.items():
             if hasattr(args, k):
                 setattr(args, k, _cast_like(getattr(args, k), v))
 
-        # Loud proof we are attached to correct task
         print(f"[ClearML] Worker attached to task_id={task.id}")
         return task.id
 
@@ -197,8 +195,7 @@ def clearml_setup_and_sync_args(args) -> Optional[str]:
 def upload_artifact(name: str, filepath: str):
     """Upload an artifact to ClearML with visible diagnostics."""
     try:
-        from clearml import Task
-        task = Task.current_task()
+        task = _get_task()
         if task is None:
             print(f"[upload_artifact] No current ClearML task. Skipping {name}.")
             return
@@ -288,8 +285,7 @@ class ClearMLScalarCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         try:
-            from clearml import Task
-            task = Task.current_task()
+            task = _get_task()
             self._logger = task.get_logger() if task else None
             print("[ClearML] logger active:", bool(self._logger))
         except Exception:
@@ -371,7 +367,7 @@ def main():
     resume_local = resolve_resume_local_path(args)
 
     print("\n========== TRAINING CONFIG ==========")
-    print("Running remotely (CLEARML_TASK_ID set):", _is_worker())
+    print("Running remotely (worker detected):", _is_worker())
     print("ClearML task id:", current_task_id if current_task_id else "(none)")
     print("Project:", args.project_name)
     print("Task name:", args.task_name)
