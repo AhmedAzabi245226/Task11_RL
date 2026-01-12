@@ -4,15 +4,9 @@ import math
 import logging
 import random
 
-# -------------------------------------------------
-# Bullet imports (ONLY on ClearML worker / Linux)
-# -------------------------------------------------
-p = None
-pybullet_data = None
+import pybullet as p
+import pybullet_data
 
-if os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"):
-    import pybullet as p
-    import pybullet_data
 
 #logging.basicConfig(level=logging.INFO)
 
