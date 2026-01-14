@@ -48,6 +48,7 @@ def _cleanup_memory(tag: str = "") -> None:
         pass
     try:
         import torch  # noqa
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
@@ -126,6 +127,7 @@ def parse_args():
 def _get_task():
     try:
         from clearml import Task
+
         t = Task.current_task()
         if t is None:
             tid = os.environ.get("CLEARML_TASK_ID")
@@ -170,6 +172,7 @@ def ensure_cpu_torch_on_worker() -> None:
     need_install = False
     try:
         import torch as _t
+
         if _t.version.cuda is not None:
             print("[torch-check] CUDA torch detected:", _t.__version__, "cuda:", _t.version.cuda)
             need_install = True
@@ -184,9 +187,15 @@ def ensure_cpu_torch_on_worker() -> None:
     print("[FIX] Installing CPU-only torch ...")
     _pip_install(
         [
-            sys.executable, "-m", "pip", "install",
-            "--no-cache-dir", "--force-reinstall", "--upgrade",
-            "--index-url", "https://download.pytorch.org/whl/cpu",
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--force-reinstall",
+            "--upgrade",
+            "--index-url",
+            "https://download.pytorch.org/whl/cpu",
             "torch==2.4.1+cpu",
         ]
     )
@@ -200,6 +209,7 @@ def ensure_pybullet_on_worker() -> None:
     try:
         import pybullet  # noqa
         import pybullet_data  # noqa
+
         print("[pybullet-check] pybullet OK")
         return
     except Exception as e:
@@ -208,8 +218,12 @@ def ensure_pybullet_on_worker() -> None:
     print("[FIX] Installing pybullet on worker...")
     _pip_install(
         [
-            sys.executable, "-m", "pip", "install",
-            "--no-cache-dir", "--upgrade",
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--upgrade",
             "pybullet==3.2.6",
         ]
     )
@@ -224,6 +238,7 @@ def resolve_resume_local_path(args) -> str:
         return ""
 
     from clearml import Task
+
     t = Task.get_task(task_id=args.resume_task_id)
 
     if args.resume_artifact not in t.artifacts:
@@ -345,7 +360,7 @@ def main():
 
     def make_vec_env() -> VecMonitor:
         def _make():
-            env = OT2GymEnv(
+            return OT2GymEnv(
                 render=args.render,
                 max_steps=args.max_steps,
                 success_threshold=args.success_threshold,
@@ -355,7 +370,6 @@ def main():
                 vel_max=args.vel_max,
                 near_goal_slowdown=args.near_goal_slowdown,
             )
-            return Monitor(env)
 
         return VecMonitor(DummyVecEnv([_make]))
 
@@ -376,19 +390,30 @@ def main():
     print("Total timesteps (rounded):", total)
     print("Checkpoint freq (rounded):", chunk)
     print(
-        "PPO: n_steps=", args.n_steps,
-        "batch=", args.batch_size,
-        "epochs=", args.n_epochs,
-        "lr=", args.learning_rate,
-        "gamma=", args.gamma,
-        "ent_coef=", args.ent_coef,
+        "PPO: n_steps=",
+        args.n_steps,
+        "batch=",
+        args.batch_size,
+        "epochs=",
+        args.n_epochs,
+        "lr=",
+        args.learning_rate,
+        "gamma=",
+        args.gamma,
+        "ent_coef=",
+        args.ent_coef,
     )
     print(
-        "Env: max_steps=", args.max_steps,
-        "thr=", args.success_threshold,
-        "vel_max=", args.vel_max,
-        "slowdown=", args.near_goal_slowdown,
-        "action_repeat=", args.action_repeat,
+        "Env: max_steps=",
+        args.max_steps,
+        "thr=",
+        args.success_threshold,
+        "vel_max=",
+        args.vel_max,
+        "slowdown=",
+        args.near_goal_slowdown,
+        "action_repeat=",
+        args.action_repeat,
     )
     print("Resume model:", resume_local if resume_local else "(none)")
     print("Save dir:", str(model_root))
@@ -439,7 +464,9 @@ def main():
         print("[save] checkpoint:", str(ckpt_base))
         model.save(str(ckpt_base))
 
-        if args.upload_checkpoints and (ckpt_index % max(1, int(args.upload_every_n_checkpoints)) == 0):
+        if args.upload_checkpoints and (
+            ckpt_index % max(1, int(args.upload_every_n_checkpoints)) == 0
+        ):
             upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
 
         _cleanup_memory(tag=f"after save {trained}")
