@@ -13,15 +13,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Hard-disable GPU visibility (still enforce CPU torch on worker below)
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
 
-# ------------------------------------------------------------
-# Paths
-# ------------------------------------------------------------
-THIS_DIR = Path(__file__).resolve().parent  # .../Task11_RL/training
-PROJECT_ROOT = THIS_DIR.parent  # .../Task11_RL
+THIS_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = THIS_DIR.parent
 
 
 # ============================================================
@@ -48,7 +44,6 @@ def _cleanup_memory(tag: str = "") -> None:
         pass
     try:
         import torch  # noqa
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
@@ -102,13 +97,8 @@ def parse_args():
     p.add_argument("--clip_range", type=float, default=0.2)
     p.add_argument("--ent_coef", type=float, default=0.0)
 
-    # IMPORTANT: stabilizer for Stage 4
-    p.add_argument(
-        "--target_kl",
-        type=float,
-        default=None,
-        help="Optional PPO target_kl. Recommended 0.02 for fine-tuning stability.",
-    )
+    # Stabilizer for fine-tuning
+    p.add_argument("--target_kl", type=float, default=None, help="Recommended 0.02 for fine-tuning stability")
 
     # Timesteps & checkpointing
     p.add_argument("--total_timesteps", type=int, default=800_000)
@@ -135,7 +125,6 @@ def parse_args():
 def _get_task():
     try:
         from clearml import Task
-
         t = Task.current_task()
         if t is None:
             tid = os.environ.get("CLEARML_TASK_ID")
@@ -180,7 +169,6 @@ def ensure_cpu_torch_on_worker() -> None:
     need_install = False
     try:
         import torch as _t
-
         if _t.version.cuda is not None:
             print("[torch-check] CUDA torch detected:", _t.__version__, "cuda:", _t.version.cuda)
             need_install = True
@@ -195,15 +183,9 @@ def ensure_cpu_torch_on_worker() -> None:
     print("[FIX] Installing CPU-only torch ...")
     _pip_install(
         [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-cache-dir",
-            "--force-reinstall",
-            "--upgrade",
-            "--index-url",
-            "https://download.pytorch.org/whl/cpu",
+            sys.executable, "-m", "pip", "install",
+            "--no-cache-dir", "--force-reinstall", "--upgrade",
+            "--index-url", "https://download.pytorch.org/whl/cpu",
             "torch==2.4.1+cpu",
         ]
     )
@@ -217,7 +199,6 @@ def ensure_pybullet_on_worker() -> None:
     try:
         import pybullet  # noqa
         import pybullet_data  # noqa
-
         print("[pybullet-check] pybullet OK")
         return
     except Exception as e:
@@ -226,12 +207,8 @@ def ensure_pybullet_on_worker() -> None:
     print("[FIX] Installing pybullet on worker...")
     _pip_install(
         [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-cache-dir",
-            "--upgrade",
+            sys.executable, "-m", "pip", "install",
+            "--no-cache-dir", "--upgrade",
             "pybullet==3.2.6",
         ]
     )
@@ -244,9 +221,7 @@ def ensure_pybullet_on_worker() -> None:
 def resolve_resume_local_path(args) -> str:
     if not args.resume_task_id:
         return ""
-
     from clearml import Task
-
     t = Task.get_task(task_id=args.resume_task_id)
 
     if args.resume_artifact not in t.artifacts:
@@ -300,10 +275,12 @@ def main():
     ensure_cpu_torch_on_worker()
     ensure_pybullet_on_worker()
 
-    # Heavy deps after worker fixes
+    # Heavy deps after fixes
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+    from stable_baselines3.common.utils import get_schedule_fn
+
     from envs.ot2_gym_wrapper import OT2GymEnv
 
     class ClearMLScalarCallback(BaseCallback):
@@ -331,7 +308,6 @@ def main():
             info = self.locals["infos"][0] if self.locals.get("infos") else {}
 
             self._ep_return += reward
-
             if done:
                 self._episodes += 1
                 self._ep_returns.append(self._ep_return)
@@ -366,7 +342,7 @@ def main():
     total = int(args.total_timesteps)
     chunk = int(args.checkpoint_freq) if int(args.checkpoint_freq) > 0 else total
 
-    # NOTE: do NOT double-wrap Monitor+VecMonitor; use VecMonitor only.
+    # Avoid Monitor+VecMonitor double wrap
     def make_vec_env() -> VecMonitor:
         def _make():
             return OT2GymEnv(
@@ -379,7 +355,6 @@ def main():
                 vel_max=args.vel_max,
                 near_goal_slowdown=args.near_goal_slowdown,
             )
-
         return VecMonitor(DummyVecEnv([_make]))
 
     def safe_close(vec_env) -> None:
@@ -399,34 +374,21 @@ def main():
     print("Total timesteps (rounded):", total)
     print("Checkpoint freq (rounded):", chunk)
     print(
-        "PPO: n_steps=",
-        args.n_steps,
-        "batch=",
-        args.batch_size,
-        "epochs=",
-        args.n_epochs,
-        "lr=",
-        args.learning_rate,
-        "gamma=",
-        args.gamma,
-        "clip_range=",
-        args.clip_range,
-        "ent_coef=",
-        args.ent_coef,
-        "target_kl=",
-        args.target_kl,
+        "PPO: n_steps=", args.n_steps,
+        "batch=", args.batch_size,
+        "epochs=", args.n_epochs,
+        "lr=", args.learning_rate,
+        "gamma=", args.gamma,
+        "clip_range=", args.clip_range,
+        "ent_coef=", args.ent_coef,
+        "target_kl=", args.target_kl,
     )
     print(
-        "Env: max_steps=",
-        args.max_steps,
-        "thr=",
-        args.success_threshold,
-        "vel_max=",
-        args.vel_max,
-        "slowdown=",
-        args.near_goal_slowdown,
-        "action_repeat=",
-        args.action_repeat,
+        "Env: max_steps=", args.max_steps,
+        "thr=", args.success_threshold,
+        "vel_max=", args.vel_max,
+        "slowdown=", args.near_goal_slowdown,
+        "action_repeat=", args.action_repeat,
     )
     print("Resume model:", resume_local if resume_local else "(none)")
     print("Save dir:", str(model_root))
@@ -438,37 +400,17 @@ def main():
         print("[resume] Loading PPO from:", resume_local)
         model = PPO.load(resume_local, env=vec_env, device="cpu")
 
-        # ---------------------------------------------------------
-        # CRITICAL: Force override key hyperparameters on resume
-        # This is why your logs showed lr=0.0003 even when passing 1e-4
-        # ---------------------------------------------------------
-        try:
-            model.learning_rate = float(args.learning_rate)
-        except Exception:
-            pass
-        try:
-            model.ent_coef = float(args.ent_coef)
-        except Exception:
-            pass
-        try:
-            model.clip_range = float(args.clip_range)
-        except Exception:
-            pass
-        try:
-            model.n_epochs = int(args.n_epochs)
-        except Exception:
-            pass
-        try:
-            model.batch_size = int(args.batch_size)
-        except Exception:
-            pass
+        # ---- CRITICAL: schedules must remain callables in SB3 ----
+        model.learning_rate = get_schedule_fn(float(args.learning_rate))
+        model.clip_range = get_schedule_fn(float(args.clip_range))
 
-        # SB3 PPO supports target_kl in constructor; on resume, set attribute if present
+        # Scalars are fine as floats
+        model.ent_coef = float(args.ent_coef)
+        model.n_epochs = int(args.n_epochs)
+        model.batch_size = int(args.batch_size)
+
         if args.target_kl is not None:
-            try:
-                model.target_kl = float(args.target_kl)
-            except Exception:
-                pass
+            model.target_kl = float(args.target_kl)
 
         print(
             "[resume] Overriding hyperparams:",
@@ -520,9 +462,7 @@ def main():
         print("[save] checkpoint:", str(ckpt_base))
         model.save(str(ckpt_base))
 
-        if args.upload_checkpoints and (
-            ckpt_index % max(1, int(args.upload_every_n_checkpoints)) == 0
-        ):
+        if args.upload_checkpoints and (ckpt_index % max(1, int(args.upload_every_n_checkpoints)) == 0):
             upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
 
         _cleanup_memory(tag=f"after save {trained}")
@@ -542,11 +482,7 @@ def main():
     if args.upload_run_zip:
         try:
             zip_base = PROJECT_ROOT / "models" / args.run_name
-            zip_file = shutil.make_archive(
-                base_name=str(zip_base),
-                format="zip",
-                root_dir=str(model_root),
-            )
+            zip_file = shutil.make_archive(base_name=str(zip_base), format="zip", root_dir=str(model_root))
             upload_artifact(name="run_folder_zip", filepath=zip_file)
         except Exception as e:
             print("[zip] FAILED:", e)
