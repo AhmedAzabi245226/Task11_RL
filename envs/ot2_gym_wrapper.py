@@ -5,10 +5,11 @@ Gymnasium-compatible environment wrapper for the Opentrons OT-2 PyBullet
 digital twin (Task 9 sim_class.py).
 
 Key design:
-- Action: pipette velocity commands [vx, vy, vz, drop] (drop unused)
+- Action: normalized velocity commands [ax, ay, az, drop] where ax,ay,az ∈ [-1, 1]
+          Internally scaled to actual velocities via vel_max. (drop unused)
 - Observation: pipette position, target position, error vector (9D)
-- Reward: progress shaping + strong distance shaping + near-goal shaping
-          + action penalty + boundary penalty + success bonus
+- Reward: progress shaping + mild distance penalty + log-distance shaping (precision)
+          + small action penalty + time penalty + boundary penalty + success bonus
 - Termination: success when distance < success_threshold
 - Truncation: max_steps
 
@@ -18,8 +19,8 @@ Stability:
 - close() aggressively disconnects PyBullet clients to prevent memory creep.
 
 Notes on precision:
-- For mm-level accuracy, coarse actions and large action_repeat cause oscillation/plateau.
-  Default settings are tuned for fine control (action_repeat=1, smaller vel_max).
+- For mm-level accuracy, use action_repeat=1 and smaller vel_max in later stages.
+- Curriculum recommended: 2cm -> 5mm -> 1mm thresholds with resume.
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ try:
     import pybullet as p  # type: ignore
 except Exception:
     p = None
-
 
 # -------------------------------------------------
 # Task 9 path setup (portable: Task 9 is inside this repo)
@@ -72,11 +72,14 @@ class OT2GymEnv(gym.Env):
         render: bool = False,
         max_steps: int = 400,
         seed: Optional[int] = None,
-        success_threshold: float = 0.01,
+        success_threshold: float = 0.02,
         debug: bool = False,
         action_repeat: int = 1,
-        vel_max: float = 0.08,
-        near_goal_slowdown: bool = True,
+        vel_max: float = 0.15,
+        near_goal_slowdown: bool = False,
+        slowdown_radius: float = 0.02,
+        slowdown_floor: float = 0.15,
+        time_penalty: float = 0.01,
     ):
         """
         Args:
@@ -88,6 +91,9 @@ class OT2GymEnv(gym.Env):
             action_repeat: repeat each action for N sim steps (keep small for precision)
             vel_max: max |vx,vy,vz| command (units consistent with sim_class)
             near_goal_slowdown: if True, scales down velocities when close to target
+            slowdown_radius: distance (m) inside which slowdown starts
+            slowdown_floor: minimum scale applied at very small distances
+            time_penalty: per-step penalty to encourage reaching quickly
         """
         super().__init__()
 
@@ -100,11 +106,15 @@ class OT2GymEnv(gym.Env):
 
         self.vel_max = float(vel_max)
         self.near_goal_slowdown = bool(near_goal_slowdown)
+        self.slowdown_radius = float(slowdown_radius)
+        self.slowdown_floor = float(slowdown_floor)
+        self.time_penalty = float(time_penalty)
 
-        # Action: vx, vy, vz, drop (drop unused)
+        # IMPORTANT: normalized action space for SB3 stability
+        # action[0:3] in [-1,1] then scaled to velocity via vel_max
         self.action_space = spaces.Box(
-            low=np.array([-self.vel_max, -self.vel_max, -self.vel_max, 0.0], dtype=np.float32),
-            high=np.array([ self.vel_max,  self.vel_max,  self.vel_max, 1.0], dtype=np.float32),
+            low=np.array([-1.0, -1.0, -1.0, 0.0], dtype=np.float32),
+            high=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -128,7 +138,6 @@ class OT2GymEnv(gym.Env):
         self.success_threshold = float(success_threshold)
         self.debug = bool(debug)
 
-        # keep small for fine control
         self.action_repeat = max(1, int(action_repeat))
 
         self.rng = np.random.default_rng(seed)
@@ -143,6 +152,8 @@ class OT2GymEnv(gym.Env):
                 "action_repeat=", self.action_repeat,
                 "vel_max=", self.vel_max,
                 "near_goal_slowdown=", self.near_goal_slowdown,
+                "slowdown_radius=", self.slowdown_radius,
+                "slowdown_floor=", self.slowdown_floor,
             )
 
     # ---------------------------
@@ -221,18 +232,23 @@ class OT2GymEnv(gym.Env):
         self.step_count += 1
 
         action = np.array(action, dtype=np.float32)
-        action[0:3] = np.clip(action[0:3], -self.vel_max, self.vel_max)
-        action[3] = 0.0  # drop unused
+        # Normalize + scale to velocity
+        a = np.clip(action[0:3], -1.0, 1.0)
+        vel = a * self.vel_max
 
-        # Optional near-goal slowdown (helps mm precision)
-        if self.near_goal_slowdown and (self.prev_distance is not None):
-            # scale down velocities inside 2cm
-            if self.prev_distance < 0.02:
-                scale = float(np.clip(self.prev_distance / 0.02, 0.15, 1.0))
-                action[0:3] *= scale
+        # Slowdown near goal (compute based on CURRENT distance; no lag)
+        d_now = None
+        if self.near_goal_slowdown:
+            pip_now = self._get_pipette()
+            d_now = float(np.linalg.norm(self.target - pip_now))
+            if d_now < self.slowdown_radius:
+                scale = float(np.clip(d_now / self.slowdown_radius, self.slowdown_floor, 1.0))
+                vel *= scale
+
+        cmd = np.array([vel[0], vel[1], vel[2], 0.0], dtype=np.float32)
 
         # Apply action for N sim steps (action repeat)
-        self.sim.run([action.tolist()], num_steps=self.action_repeat)
+        self.sim.run([cmd.tolist()], num_steps=self.action_repeat)
 
         obs = self._get_obs()
         pipette = obs[0:3]
@@ -240,22 +256,24 @@ class OT2GymEnv(gym.Env):
         distance = float(np.linalg.norm(error_vec))
 
         # -----------------------
-        # Reward shaping (precision-focused)
+        # Reward shaping (stable + precision-focused)
         # -----------------------
         progress = (self.prev_distance - distance) if self.prev_distance is not None else 0.0
 
-        # main objective: keep reducing distance
-        reward = 10.0 * float(progress)
-        reward -= 1.0 * distance  # stronger than before
+        # Dense improvement signal
+        reward = 5.0 * float(progress)
 
-        # discourage thrashing
-        reward -= 0.01 * float(np.linalg.norm(action[0:3]))
+        # Mild distance penalty (do NOT over-dominate returns)
+        reward -= 0.1 * distance
 
-        # near-goal shaping (creates gradient down to mm scale)
-        if distance < 0.02:
-            reward += (0.02 - distance) * 10.0
-        if distance < 0.005:
-            reward += (0.005 - distance) * 50.0
+        # Precision shaping: keep gradient strong as distance -> 0
+        eps = 1e-6
+        if self.prev_distance is not None:
+            reward += 0.5 * (np.log(self.prev_distance + eps) - np.log(distance + eps))
+
+        # Small effort + time cost
+        reward -= 0.001 * float(np.linalg.norm(vel))
+        reward -= float(self.time_penalty)
 
         # Boundary penalty
         x, y, z = float(pipette[0]), float(pipette[1]), float(pipette[2])
@@ -273,7 +291,7 @@ class OT2GymEnv(gym.Env):
 
         success = distance < self.success_threshold
         if success:
-            reward += 20.0  # stronger terminal bonus to prefer finishing
+            reward += 20.0
 
         terminated = success
         truncated = self.step_count >= self.max_steps
@@ -286,6 +304,8 @@ class OT2GymEnv(gym.Env):
             "edge_pen": edge_pen,
             "action_repeat": self.action_repeat,
             "vel_max": self.vel_max,
+            "near_goal_slowdown": self.near_goal_slowdown,
+            "d_now": d_now if d_now is not None else distance,
         }
 
         if self.debug and (self.step_count % 50 == 0 or success):
@@ -295,6 +315,7 @@ class OT2GymEnv(gym.Env):
                 "success", success,
                 "reward", float(reward),
                 "edge_pen", edge_pen,
+                "vel_norm", float(np.linalg.norm(vel)),
             )
 
         return obs, float(reward), terminated, truncated, info
