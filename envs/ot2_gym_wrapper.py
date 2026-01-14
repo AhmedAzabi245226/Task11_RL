@@ -7,7 +7,8 @@ Gymnasium-compatible environment wrapper for the Opentrons OT-2 PyBullet digital
 Key design:
 - Action: pipette velocity commands [vx, vy, vz, drop] (drop unused)
 - Observation: pipette position, target position, and error vector (9D)
-- Reward: progress shaping + distance shaping + success bonus + small action penalty + boundary penalty
+- Reward: progress shaping + distance shaping + near-goal shaping + success bonus
+          + action penalty + boundary penalty
 - Termination: success when error < success_threshold
 - Truncation: max_steps
 
@@ -45,10 +46,10 @@ if not TASK9_PATH.exists():
     raise FileNotFoundError(
         f"Task 9 folder not found at: {TASK9_PATH}\n"
         "Expected layout:\n"
-        "  Task11_RL/\n"
-        "    envs/ot2_gym_wrapper.py\n"
-        "    task09_robotics_environment/\n"
-        "      sim_class.py, URDFs, meshes/, textures/\n"
+        " Task11_RL/\n"
+        " envs/ot2_gym_wrapper.py\n"
+        " task09_robotics_environment/\n"
+        " sim_class.py, URDFs, meshes/, textures/\n"
     )
 
 if str(TASK9_PATH) not in sys.path:
@@ -70,8 +71,8 @@ class OT2GymEnv(gym.Env):
         success_threshold: float = 0.01,
         debug: bool = False,
         action_repeat: int = 1,
-        vel_max: float = 0.08,
-        near_goal_slowdown: bool = True,
+        vel_max: float = 0.3,
+        near_goal_slowdown: bool = False,
     ):
         super().__init__()
 
@@ -82,20 +83,12 @@ class OT2GymEnv(gym.Env):
         # Create simulation (PyBullet lives inside Simulation)
         self.sim = Simulation(num_agents=1, render=render, rgb_array=False)
 
-        # Workspace boundaries from Task 9 (meters)
-        self.X_MIN, self.X_MAX = -0.187, 0.253
-        self.Y_MIN, self.Y_MAX = -0.1706, 0.2196
-        self.Z_MIN, self.Z_MAX = 0.1195, 0.2896
-
-        self.margin = 0.02
-
         self.max_steps = int(max_steps)
         self.step_count = 0
-
         self.success_threshold = float(success_threshold)
         self.debug = bool(debug)
-
         self.action_repeat = max(1, int(action_repeat))
+
         self.vel_max = float(vel_max)
         self.near_goal_slowdown = bool(near_goal_slowdown)
 
@@ -113,6 +106,12 @@ class OT2GymEnv(gym.Env):
             shape=(9,),
             dtype=np.float32,
         )
+
+        # Workspace boundaries from Task 9 (meters)
+        self.X_MIN, self.X_MAX = -0.187, 0.253
+        self.Y_MIN, self.Y_MAX = -0.1706, 0.2196
+        self.Z_MIN, self.Z_MAX = 0.1195, 0.2896
+        self.margin = 0.02
 
         self.rng = np.random.default_rng(seed)
         self.target = np.zeros(3, dtype=np.float32)
@@ -170,6 +169,7 @@ class OT2GymEnv(gym.Env):
         options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         super().reset(seed=seed)
+
         self._set_cwd_for_assets()
 
         if seed is not None:
@@ -206,9 +206,9 @@ class OT2GymEnv(gym.Env):
         action[0:3] = np.clip(action[0:3], -self.vel_max, self.vel_max)
         action[3] = 0.0  # drop unused
 
-        # Optional near-goal slowdown to help fine precision
+        # Optional slowdown near goal (helps fine precision with smaller thr)
         if self.near_goal_slowdown and (self.prev_distance is not None):
-            if self.prev_distance < 0.02:  # inside 2 cm
+            if self.prev_distance < 0.02:  # inside 2cm
                 scale = float(np.clip(self.prev_distance / 0.02, 0.15, 1.0))
                 action[0:3] *= scale
 
@@ -222,9 +222,16 @@ class OT2GymEnv(gym.Env):
 
         # Reward shaping
         progress = (self.prev_distance - distance) if self.prev_distance is not None else 0.0
+
         reward = 10.0 * float(progress)
         reward -= 0.2 * distance
         reward -= 0.01 * float(np.linalg.norm(action[0:3]))
+
+        # Near-goal shaping (keeps gradient when threshold is small)
+        if distance < 0.02:
+            reward += (0.02 - distance) * 2.0
+        if distance < 0.005:
+            reward += (0.005 - distance) * 10.0
 
         # Boundary penalty
         x, y, z = float(pipette[0]), float(pipette[1]), float(pipette[2])
