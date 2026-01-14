@@ -6,16 +6,20 @@ digital twin (Task 9 sim_class.py).
 
 Key design:
 - Action: pipette velocity commands [vx, vy, vz, drop] (drop unused)
-- Observation: pipette position, target position, and error vector
-- Reward: progress shaping + distance shaping + success bonus
-          + small action penalty + boundary penalty
-- Termination: success when error < success_threshold
+- Observation: pipette position, target position, error vector (9D)
+- Reward: progress shaping + strong distance shaping + near-goal shaping
+          + action penalty + boundary penalty + success bonus
+- Termination: success when distance < success_threshold
 - Truncation: max_steps
 
 Compatible with Stable Baselines 3.
 
-Critical stability fix:
-- close() aggressively disconnects PyBullet clients to prevent native memory creep.
+Stability:
+- close() aggressively disconnects PyBullet clients to prevent memory creep.
+
+Notes on precision:
+- For mm-level accuracy, coarse actions and large action_repeat cause oscillation/plateau.
+  Default settings are tuned for fine control (action_repeat=1, smaller vel_max).
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from gymnasium import spaces
 try:
     import pybullet as p  # type: ignore
 except Exception:
-    p = None  # close() will handle
+    p = None
 
 
 # -------------------------------------------------
@@ -66,12 +70,25 @@ class OT2GymEnv(gym.Env):
     def __init__(
         self,
         render: bool = False,
-        max_steps: int = 200,
+        max_steps: int = 400,
         seed: Optional[int] = None,
         success_threshold: float = 0.01,
         debug: bool = False,
         action_repeat: int = 1,
+        vel_max: float = 0.08,
+        near_goal_slowdown: bool = True,
     ):
+        """
+        Args:
+            render: enable GUI rendering (avoid on headless servers)
+            max_steps: episode length cap (truncation)
+            seed: RNG seed
+            success_threshold: success distance (meters)
+            debug: print debug telemetry
+            action_repeat: repeat each action for N sim steps (keep small for precision)
+            vel_max: max |vx,vy,vz| command (units consistent with sim_class)
+            near_goal_slowdown: if True, scales down velocities when close to target
+        """
         super().__init__()
 
         self._old_cwd = os.getcwd()
@@ -81,10 +98,13 @@ class OT2GymEnv(gym.Env):
         # Create simulation (PyBullet lives inside Simulation)
         self.sim = Simulation(num_agents=1, render=render, rgb_array=False)
 
+        self.vel_max = float(vel_max)
+        self.near_goal_slowdown = bool(near_goal_slowdown)
+
         # Action: vx, vy, vz, drop (drop unused)
         self.action_space = spaces.Box(
-            low=np.array([-0.3, -0.3, -0.3, 0.0], dtype=np.float32),
-            high=np.array([0.3, 0.3, 0.3, 1.0], dtype=np.float32),
+            low=np.array([-self.vel_max, -self.vel_max, -self.vel_max, 0.0], dtype=np.float32),
+            high=np.array([ self.vel_max,  self.vel_max,  self.vel_max, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -108,6 +128,7 @@ class OT2GymEnv(gym.Env):
         self.success_threshold = float(success_threshold)
         self.debug = bool(debug)
 
+        # keep small for fine control
         self.action_repeat = max(1, int(action_repeat))
 
         self.rng = np.random.default_rng(seed)
@@ -120,6 +141,8 @@ class OT2GymEnv(gym.Env):
                 "success_threshold=", self.success_threshold,
                 "max_steps=", self.max_steps,
                 "action_repeat=", self.action_repeat,
+                "vel_max=", self.vel_max,
+                "near_goal_slowdown=", self.near_goal_slowdown,
             )
 
     # ---------------------------
@@ -198,8 +221,15 @@ class OT2GymEnv(gym.Env):
         self.step_count += 1
 
         action = np.array(action, dtype=np.float32)
-        action[0:3] = np.clip(action[0:3], -0.3, 0.3)
+        action[0:3] = np.clip(action[0:3], -self.vel_max, self.vel_max)
         action[3] = 0.0  # drop unused
+
+        # Optional near-goal slowdown (helps mm precision)
+        if self.near_goal_slowdown and (self.prev_distance is not None):
+            # scale down velocities inside 2cm
+            if self.prev_distance < 0.02:
+                scale = float(np.clip(self.prev_distance / 0.02, 0.15, 1.0))
+                action[0:3] *= scale
 
         # Apply action for N sim steps (action repeat)
         self.sim.run([action.tolist()], num_steps=self.action_repeat)
@@ -209,11 +239,23 @@ class OT2GymEnv(gym.Env):
         error_vec = self.target - pipette
         distance = float(np.linalg.norm(error_vec))
 
-        # Reward shaping
+        # -----------------------
+        # Reward shaping (precision-focused)
+        # -----------------------
         progress = (self.prev_distance - distance) if self.prev_distance is not None else 0.0
+
+        # main objective: keep reducing distance
         reward = 10.0 * float(progress)
-        reward -= 0.2 * distance
+        reward -= 1.0 * distance  # stronger than before
+
+        # discourage thrashing
         reward -= 0.01 * float(np.linalg.norm(action[0:3]))
+
+        # near-goal shaping (creates gradient down to mm scale)
+        if distance < 0.02:
+            reward += (0.02 - distance) * 10.0
+        if distance < 0.005:
+            reward += (0.005 - distance) * 50.0
 
         # Boundary penalty
         x, y, z = float(pipette[0]), float(pipette[1]), float(pipette[2])
@@ -231,7 +273,7 @@ class OT2GymEnv(gym.Env):
 
         success = distance < self.success_threshold
         if success:
-            reward += 10.0
+            reward += 20.0  # stronger terminal bonus to prefer finishing
 
         terminated = success
         truncated = self.step_count >= self.max_steps
@@ -243,6 +285,7 @@ class OT2GymEnv(gym.Env):
             "is_success": success,
             "edge_pen": edge_pen,
             "action_repeat": self.action_repeat,
+            "vel_max": self.vel_max,
         }
 
         if self.debug and (self.step_count % 50 == 0 or success):
@@ -250,7 +293,7 @@ class OT2GymEnv(gym.Env):
                 "DEBUG step", self.step_count,
                 "distance", distance,
                 "success", success,
-                "reward", reward,
+                "reward", float(reward),
                 "edge_pen", edge_pen,
             )
 
@@ -263,10 +306,8 @@ class OT2GymEnv(gym.Env):
         """
         Critical: aggressively release PyBullet native memory.
 
-        This prevents long ClearML runs from crashing with std::bad_alloc / exit code 139
-        when Bullet clients are not disconnected cleanly.
+        Prevents long runs from crashing when Bullet clients are not disconnected.
         """
-        # 1) Try sim.close()
         try:
             if hasattr(self, "sim") and self.sim is not None:
                 try:
@@ -274,7 +315,6 @@ class OT2GymEnv(gym.Env):
                 except Exception:
                     pass
         finally:
-            # 2) Hard disconnect Bullet clients (safe if none exist)
             try:
                 if p is not None:
                     for cid in range(0, 32):
@@ -291,10 +331,10 @@ class OT2GymEnv(gym.Env):
             except Exception:
                 pass
 
-            # 3) Restore cwd
             try:
                 if getattr(self, "_old_cwd", None) is not None:
                     os.chdir(self._old_cwd)
             except Exception:
                 pass
+
             self._cwd_set = False
