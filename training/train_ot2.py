@@ -1,5 +1,25 @@
 from __future__ import annotations
 
+"""
+train.py — Task 11 RL Controller (Stable Baselines 3 + ClearML)
+
+Single training script for all curriculum stages (A/B/C) using CLI arguments.
+
+Key improvements included:
+1) Proper boolean CLI parsing (near_goal_slowdown true/false)
+2) Stage A-friendly defaults (easier reaching to get success > 0 quickly)
+3) ClearML remote execution without importing heavy deps locally
+4) Worker fixes: force CPU-only torch, install pybullet if missing
+5) Optional VecNormalize support (recommended) with save/load of stats
+6) Resume-from-ClearML-artifact support (Stage B/C fine-tuning)
+7) Chunked training with checkpointing and final model upload
+
+Recommended curriculum:
+- Stage A: thr=0.02, vel_max=0.15, slowdown=false
+- Stage B: thr=0.005, vel_max=0.10, slowdown=true (resume from Stage A)
+- Stage C: thr=0.001, vel_max=0.08, slowdown=true (resume from Stage B)
+"""
+
 # ============================================================
 # ABSOLUTE TOP (stdlib only) — do not import SB3 / torch / envs
 # ============================================================
@@ -13,6 +33,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# Force CPU (also avoids CUDA/CUPTI headaches on shared workers)
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
 
@@ -58,6 +79,17 @@ def round_up_to_multiple(x: int, m: int) -> int:
     return int(((x + m - 1) // m) * m)
 
 
+def str2bool(v: str | bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    s = v.strip().lower()
+    if s in ("true", "1", "yes", "y", "t"):
+        return True
+    if s in ("false", "0", "no", "n", "f"):
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean true/false, got: {v!r}")
+
+
 # ============================================================
 # Args
 # ============================================================
@@ -65,49 +97,54 @@ def parse_args():
     p = argparse.ArgumentParser()
 
     # ClearML
-    p.add_argument("--use_clearml", action="store_true")
+    p.add_argument("--use_clearml", action="store_true", help="Enqueue remotely via ClearML")
     p.add_argument("--project_name", type=str, default="Mentor Group - Alican/Group 1")
     p.add_argument("--task_name", type=str, default="OT2_PPO_Train")
     p.add_argument("--queue", type=str, default="default")
     p.add_argument("--docker", type=str, default="deanis/2023y2b-rl:latest")
 
     # Run bookkeeping
-    p.add_argument("--run_name", type=str, default="")
+    p.add_argument("--run_name", type=str, default="", help="models/<run_name>/...")
     p.add_argument("--seed", type=int, default=0)
 
-    # Env (precision-friendly defaults)
-    p.add_argument("--max_steps", type=int, default=600)
-    p.add_argument("--success_threshold", type=float, default=0.01)  # Stage A default
+    # --------------------------------------------------------
+    # Env defaults: Stage A (easy reaching; get success > 0)
+    # --------------------------------------------------------
+    p.add_argument("--max_steps", type=int, default=400)
+    p.add_argument("--success_threshold", type=float, default=0.02)  # 2 cm
     p.add_argument("--action_repeat", type=int, default=1)
-    p.add_argument("--vel_max", type=float, default=0.08)
-    p.add_argument("--near_goal_slowdown", action="store_true")
-    p.set_defaults(near_goal_slowdown=True)
-    p.add_argument("--render", action="store_true")
+    p.add_argument("--vel_max", type=float, default=0.15)
+    p.add_argument("--near_goal_slowdown", type=str2bool, default=False)
+    p.add_argument("--render", action="store_true", help="GUI render (avoid on workers)")
 
-    # PPO hyperparameters (better for continuous control)
+    # PPO hyperparameters (strong baseline for continuous control)
     p.add_argument("--learning_rate", type=float, default=3e-4)
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--n_steps", type=int, default=2048)
     p.add_argument("--n_epochs", type=int, default=10)
     p.add_argument("--gamma", type=float, default=0.995)
     p.add_argument("--clip_range", type=float, default=0.2)
-    p.add_argument("--ent_coef", type=float, default=0.01)
+    p.add_argument("--ent_coef", type=float, default=0.005)
 
     # Timesteps & checkpointing
     p.add_argument("--total_timesteps", type=int, default=800_000)
     p.add_argument("--checkpoint_freq", type=int, default=204_800)
 
-    # Resume
-    p.add_argument("--resume_task_id", type=str, default="")
-    p.add_argument("--resume_artifact", type=str, default="ppo_final_model")
-    p.add_argument("--reset_timesteps", action="store_true")
+    # Resume from ClearML
+    p.add_argument("--resume_task_id", type=str, default="", help="ClearML task id to resume from")
+    p.add_argument("--resume_artifact", type=str, default="ppo_final_model", help="Artifact name")
+    p.add_argument("--reset_timesteps", type=str2bool, default=False, help="Reset SB3 timestep counter")
+
+    # VecNormalize (recommended for stability and precision)
+    p.add_argument("--use_vecnormalize", type=str2bool, default=True)
+    p.add_argument("--norm_reward", type=str2bool, default=True)
+    p.add_argument("--clip_obs", type=float, default=10.0)
 
     # Upload controls
-    p.add_argument("--upload_checkpoints", action="store_true")
+    p.add_argument("--upload_checkpoints", type=str2bool, default=False)
     p.add_argument("--upload_every_n_checkpoints", type=int, default=1)
-    p.add_argument("--upload_final", action="store_true")
-    p.add_argument("--upload_run_zip", action="store_true")
-    p.set_defaults(upload_checkpoints=False, upload_final=True, upload_run_zip=False)
+    p.add_argument("--upload_final", type=str2bool, default=True)
+    p.add_argument("--upload_run_zip", type=str2bool, default=False)
 
     return p.parse_args()
 
@@ -129,6 +166,12 @@ def _get_task():
 
 
 def clearml_setup_and_exit_if_local(args) -> Optional[str]:
+    """
+    - Local + --use_clearml: create task, set docker, enqueue, then exit immediately.
+      This avoids importing SB3/torch/pybullet locally.
+    - Worker: attach to task and continue.
+    - No ClearML: run locally.
+    """
     if not args.use_clearml and not _is_worker():
         return None
 
@@ -146,7 +189,6 @@ def clearml_setup_and_exit_if_local(args) -> Optional[str]:
     task = Task.init(project_name=args.project_name, task_name=args.task_name)
     task.connect(vars(args), name="cli_args")
     task.set_base_docker(args.docker)
-
     print("[ClearML] Enqueuing to queue:", args.queue)
     task.execute_remotely(queue_name=args.queue)
     raise SystemExit(0)
@@ -186,7 +228,6 @@ def ensure_cpu_torch_on_worker() -> None:
 def ensure_pybullet_on_worker() -> None:
     if not _is_worker():
         return
-
     try:
         import pybullet  # noqa
         import pybullet_data  # noqa
@@ -210,7 +251,6 @@ def ensure_pybullet_on_worker() -> None:
 def resolve_resume_local_path(args) -> str:
     if not args.resume_task_id:
         return ""
-
     from clearml import Task
     t = Task.get_task(task_id=args.resume_task_id)
 
@@ -256,19 +296,22 @@ def upload_artifact(name: str, filepath: str) -> None:
 def main():
     args = parse_args()
 
+    # Ensure project root on path for env imports (worker will clone repo)
     os.chdir(str(PROJECT_ROOT))
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
 
     current_task_id = clearml_setup_and_exit_if_local(args)
 
+    # Worker-only: enforce dependencies before importing SB3/env
     ensure_cpu_torch_on_worker()
     ensure_pybullet_on_worker()
 
+    # Heavy imports (safe now)
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.monitor import Monitor
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecNormalize
     from envs.ot2_gym_wrapper import OT2GymEnv
 
     class ClearMLScalarCallback(BaseCallback):
@@ -314,13 +357,14 @@ def main():
                 self._logger.report_scalar("time", "timesteps", it, iteration=it)
                 self._logger.report_scalar("rollout", "ep_rew_mean_est", ep_rew_mean_est, iteration=it)
                 self._logger.report_scalar("rollout", "success_rate_est", success_rate_est, iteration=it)
-
             return True
 
+    # Run naming
     if not args.run_name:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.run_name = f"ot2_run_{stamp}"
 
+    # Round timesteps to multiples of rollout length (SB3 requirement-ish)
     rollout = int(args.n_steps)
     args.total_timesteps = round_up_to_multiple(args.total_timesteps, rollout)
     args.checkpoint_freq = round_up_to_multiple(args.checkpoint_freq, rollout)
@@ -331,7 +375,8 @@ def main():
     total = int(args.total_timesteps)
     chunk = int(args.checkpoint_freq) if int(args.checkpoint_freq) > 0 else total
 
-    def make_vec_env() -> VecMonitor:
+    # Vec env factory
+    def make_vec_env():
         def _make():
             env = OT2GymEnv(
                 render=args.render,
@@ -345,7 +390,15 @@ def main():
             )
             return Monitor(env)
 
-        return VecMonitor(DummyVecEnv([_make]))
+        venv = VecMonitor(DummyVecEnv([_make]))
+        if args.use_vecnormalize:
+            venv = VecNormalize(
+                venv,
+                norm_obs=True,
+                norm_reward=bool(args.norm_reward),
+                clip_obs=float(args.clip_obs),
+            )
+        return venv
 
     def safe_close(vec_env) -> None:
         try:
@@ -355,23 +408,54 @@ def main():
             pass
         _cleanup_memory(tag="after env.close()")
 
+    # Resume (model + VecNormalize stats if present)
     resume_local = resolve_resume_local_path(args)
+    resume_vecnorm = ""
+    if resume_local:
+        # If previous run folder exists locally, user might copy vecnormalize.pkl alongside model
+        # For ClearML resume: you can optionally upload vecnormalize.pkl as artifact too.
+        # Here we simply look in the same directory as the downloaded model.
+        try:
+            cand = Path(resume_local).resolve().parent / "vecnormalize.pkl"
+            if cand.exists():
+                resume_vecnorm = str(cand)
+        except Exception:
+            resume_vecnorm = ""
 
+    # Print config
     print("\n========== TRAINING CONFIG ==========")
     print("Worker:", _is_worker())
     print("ClearML task id:", current_task_id if current_task_id else "(none)")
     print("Run name:", args.run_name)
     print("Total timesteps (rounded):", total)
     print("Checkpoint freq (rounded):", chunk)
-    print("n_steps:", args.n_steps, "batch:", args.batch_size, "epochs:", args.n_epochs)
-    print("success_threshold:", args.success_threshold)
-    print("action_repeat:", args.action_repeat, "vel_max:", args.vel_max, "near_goal_slowdown:", args.near_goal_slowdown)
-    print("Resume:", resume_local if resume_local else "(none)")
+    print("PPO: n_steps=", args.n_steps, "batch=", args.batch_size, "epochs=", args.n_epochs,
+          "lr=", args.learning_rate, "gamma=", args.gamma, "ent_coef=", args.ent_coef)
+    print("Env: max_steps=", args.max_steps,
+          "thr=", args.success_threshold,
+          "vel_max=", args.vel_max,
+          "slowdown=", args.near_goal_slowdown,
+          "action_repeat=", args.action_repeat)
+    print("VecNormalize:", bool(args.use_vecnormalize), "norm_reward:", bool(args.norm_reward), "clip_obs:", args.clip_obs)
+    print("Resume model:", resume_local if resume_local else "(none)")
+    print("Resume vecnorm:", resume_vecnorm if resume_vecnorm else "(none)")
     print("Save dir:", str(model_root))
     print("====================================\n")
 
+    # Build env (load VecNormalize stats if resuming and available)
     vec_env = make_vec_env()
+    if args.use_vecnormalize and resume_vecnorm:
+        try:
+            # VecNormalize.load replaces wrapper; keep same env instance structure
+            from stable_baselines3.common.vec_env import VecNormalize
+            vec_env = VecNormalize.load(resume_vecnorm, vec_env)
+            vec_env.training = True
+            vec_env.norm_reward = bool(args.norm_reward)
+            print("[vecnorm] Loaded stats:", resume_vecnorm)
+        except Exception as e:
+            print("[vecnorm] Failed to load stats:", repr(e))
 
+    # Create / Load model
     if resume_local:
         print("[resume] Loading PPO from:", resume_local)
         model = PPO.load(resume_local, env=vec_env, device="cpu")
@@ -392,6 +476,7 @@ def main():
 
     cb = ClearMLScalarCallback(report_every_steps=max(512, int(args.n_steps)))
 
+    # Chunked training + checkpointing
     trained = 0
     ckpt_index = 0
 
@@ -414,21 +499,45 @@ def main():
         print("[save] checkpoint:", str(ckpt_base))
         model.save(str(ckpt_base))
 
+        # Save VecNormalize stats alongside checkpoints (critical for eval reproducibility)
+        if args.use_vecnormalize:
+            try:
+                vec_path = model_root / "vecnormalize.pkl"
+                vec_env.save(str(vec_path))
+            except Exception as e:
+                print("[vecnorm] save failed:", repr(e))
+
         if args.upload_checkpoints and (ckpt_index % max(1, int(args.upload_every_n_checkpoints)) == 0):
             upload_artifact(name=f"ppo_checkpoint_{trained}_steps", filepath=ckpt_zip)
+            if args.use_vecnormalize:
+                vec_path = str(model_root / "vecnormalize.pkl")
+                upload_artifact(name=f"vecnormalize_{trained}_steps", filepath=vec_path)
 
         _cleanup_memory(tag=f"after save {trained}")
 
+    # Final save
     final_base = model_root / "ppo_ot2_final"
     final_zip = str(final_base) + ".zip"
     model.save(str(final_base))
     print("Training finished successfully.")
     print("Saved to:", str(final_base))
 
+    # Save final VecNormalize stats
+    if args.use_vecnormalize:
+        try:
+            vec_path = model_root / "vecnormalize.pkl"
+            vec_env.save(str(vec_path))
+            print("[vecnorm] Saved final stats:", vec_path)
+        except Exception as e:
+            print("[vecnorm] final save failed:", repr(e))
+
     safe_close(vec_env)
 
+    # Upload final artifacts
     if args.upload_final:
         upload_artifact(name="ppo_final_model", filepath=final_zip)
+        if args.use_vecnormalize:
+            upload_artifact(name="vecnormalize_final", filepath=str(model_root / "vecnormalize.pkl"))
 
     if args.upload_run_zip:
         try:
