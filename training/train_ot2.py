@@ -102,6 +102,14 @@ def parse_args():
     p.add_argument("--clip_range", type=float, default=0.2)
     p.add_argument("--ent_coef", type=float, default=0.0)
 
+    # IMPORTANT: stabilizer for Stage 4
+    p.add_argument(
+        "--target_kl",
+        type=float,
+        default=None,
+        help="Optional PPO target_kl. Recommended 0.02 for fine-tuning stability.",
+    )
+
     # Timesteps & checkpointing
     p.add_argument("--total_timesteps", type=int, default=800_000)
     p.add_argument("--checkpoint_freq", type=int, default=102_400)
@@ -292,9 +300,9 @@ def main():
     ensure_cpu_torch_on_worker()
     ensure_pybullet_on_worker()
 
+    # Heavy deps after worker fixes
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback
-    from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
     from envs.ot2_gym_wrapper import OT2GymEnv
 
@@ -358,6 +366,7 @@ def main():
     total = int(args.total_timesteps)
     chunk = int(args.checkpoint_freq) if int(args.checkpoint_freq) > 0 else total
 
+    # NOTE: do NOT double-wrap Monitor+VecMonitor; use VecMonitor only.
     def make_vec_env() -> VecMonitor:
         def _make():
             return OT2GymEnv(
@@ -400,8 +409,12 @@ def main():
         args.learning_rate,
         "gamma=",
         args.gamma,
+        "clip_range=",
+        args.clip_range,
         "ent_coef=",
         args.ent_coef,
+        "target_kl=",
+        args.target_kl,
     )
     print(
         "Env: max_steps=",
@@ -424,6 +437,48 @@ def main():
     if resume_local:
         print("[resume] Loading PPO from:", resume_local)
         model = PPO.load(resume_local, env=vec_env, device="cpu")
+
+        # ---------------------------------------------------------
+        # CRITICAL: Force override key hyperparameters on resume
+        # This is why your logs showed lr=0.0003 even when passing 1e-4
+        # ---------------------------------------------------------
+        try:
+            model.learning_rate = float(args.learning_rate)
+        except Exception:
+            pass
+        try:
+            model.ent_coef = float(args.ent_coef)
+        except Exception:
+            pass
+        try:
+            model.clip_range = float(args.clip_range)
+        except Exception:
+            pass
+        try:
+            model.n_epochs = int(args.n_epochs)
+        except Exception:
+            pass
+        try:
+            model.batch_size = int(args.batch_size)
+        except Exception:
+            pass
+
+        # SB3 PPO supports target_kl in constructor; on resume, set attribute if present
+        if args.target_kl is not None:
+            try:
+                model.target_kl = float(args.target_kl)
+            except Exception:
+                pass
+
+        print(
+            "[resume] Overriding hyperparams:",
+            "lr=", args.learning_rate,
+            "ent_coef=", args.ent_coef,
+            "clip_range=", args.clip_range,
+            "n_epochs=", args.n_epochs,
+            "batch_size=", args.batch_size,
+            "target_kl=", args.target_kl,
+        )
     else:
         model = PPO(
             "MlpPolicy",
@@ -436,6 +491,7 @@ def main():
             gamma=args.gamma,
             clip_range=args.clip_range,
             ent_coef=args.ent_coef,
+            target_kl=args.target_kl,
             device="cpu",
         )
 
@@ -486,7 +542,11 @@ def main():
     if args.upload_run_zip:
         try:
             zip_base = PROJECT_ROOT / "models" / args.run_name
-            zip_file = shutil.make_archive(base_name=str(zip_base), format="zip", root_dir=str(model_root))
+            zip_file = shutil.make_archive(
+                base_name=str(zip_base),
+                format="zip",
+                root_dir=str(model_root),
+            )
             upload_artifact(name="run_folder_zip", filepath=zip_file)
         except Exception as e:
             print("[zip] FAILED:", e)
