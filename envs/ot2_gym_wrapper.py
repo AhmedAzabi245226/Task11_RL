@@ -1,26 +1,19 @@
 """
 ot2_gym_wrapper.py (Task 11 – RL Controller)
 
-Gymnasium-compatible environment wrapper for the Opentrons OT-2 PyBullet
-digital twin (Task 9 sim_class.py).
+Gymnasium-compatible environment wrapper for the Opentrons OT-2 PyBullet digital twin
+(Task 9 sim_class.py).
 
 Key design:
-- Action: normalized velocity commands [ax, ay, az, drop] where ax,ay,az ∈ [-1, 1]
-          Internally scaled to actual velocities via vel_max. (drop unused)
-- Observation: pipette position, target position, error vector (9D)
-- Reward: progress shaping + mild distance penalty + log-distance shaping (precision)
-          + small action penalty + time penalty + boundary penalty + success bonus
-- Termination: success when distance < success_threshold
+- Action: pipette velocity commands [vx, vy, vz, drop] (drop unused)
+- Observation: pipette position, target position, and error vector
+- Reward: progress shaping + distance shaping + success bonus + small action penalty + boundary penalty
+- Termination: success when error < success_threshold
 - Truncation: max_steps
-
 Compatible with Stable Baselines 3.
 
-Stability:
-- close() aggressively disconnects PyBullet clients to prevent memory creep.
-
-Notes on precision:
-- For mm-level accuracy, use action_repeat=1 and smaller vel_max in later stages.
-- Curriculum recommended: 2cm -> 5mm -> 1mm thresholds with resume.
+Critical stability fix:
+- close() aggressively disconnects PyBullet clients to prevent native memory creep.
 """
 
 from __future__ import annotations
@@ -38,7 +31,8 @@ from gymnasium import spaces
 try:
     import pybullet as p  # type: ignore
 except Exception:
-    p = None
+    p = None  # close() will handle
+
 
 # -------------------------------------------------
 # Task 9 path setup (portable: Task 9 is inside this repo)
@@ -50,10 +44,10 @@ if not TASK9_PATH.exists():
     raise FileNotFoundError(
         f"Task 9 folder not found at: {TASK9_PATH}\n"
         "Expected layout:\n"
-        "  Task11_RL/\n"
-        "    envs/ot2_gym_wrapper.py\n"
-        "    task09_robotics_environment/\n"
-        "      sim_class.py, URDFs, meshes/, textures/\n"
+        " Task11_RL/\n"
+        " envs/ot2_gym_wrapper.py\n"
+        " task09_robotics_environment/\n"
+        " sim_class.py, URDFs, meshes/, textures/\n"
     )
 
 if str(TASK9_PATH) not in sys.path:
@@ -70,31 +64,12 @@ class OT2GymEnv(gym.Env):
     def __init__(
         self,
         render: bool = False,
-        max_steps: int = 400,
+        max_steps: int = 200,
         seed: Optional[int] = None,
-        success_threshold: float = 0.02,
+        success_threshold: float = 0.01,
         debug: bool = False,
         action_repeat: int = 1,
-        vel_max: float = 0.15,
-        near_goal_slowdown: bool = False,
-        slowdown_radius: float = 0.02,
-        slowdown_floor: float = 0.15,
-        time_penalty: float = 0.01,
     ):
-        """
-        Args:
-            render: enable GUI rendering (avoid on headless servers)
-            max_steps: episode length cap (truncation)
-            seed: RNG seed
-            success_threshold: success distance (meters)
-            debug: print debug telemetry
-            action_repeat: repeat each action for N sim steps (keep small for precision)
-            vel_max: max |vx,vy,vz| command (units consistent with sim_class)
-            near_goal_slowdown: if True, scales down velocities when close to target
-            slowdown_radius: distance (m) inside which slowdown starts
-            slowdown_floor: minimum scale applied at very small distances
-            time_penalty: per-step penalty to encourage reaching quickly
-        """
         super().__init__()
 
         self._old_cwd = os.getcwd()
@@ -104,17 +79,10 @@ class OT2GymEnv(gym.Env):
         # Create simulation (PyBullet lives inside Simulation)
         self.sim = Simulation(num_agents=1, render=render, rgb_array=False)
 
-        self.vel_max = float(vel_max)
-        self.near_goal_slowdown = bool(near_goal_slowdown)
-        self.slowdown_radius = float(slowdown_radius)
-        self.slowdown_floor = float(slowdown_floor)
-        self.time_penalty = float(time_penalty)
-
-        # IMPORTANT: normalized action space for SB3 stability
-        # action[0:3] in [-1,1] then scaled to velocity via vel_max
+        # Action: vx, vy, vz, drop (drop unused)
         self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0, -1.0, 0.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            low=np.array([-0.3, -0.3, -0.3, 0.0], dtype=np.float32),
+            high=np.array([0.3, 0.3, 0.3, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
@@ -132,12 +100,11 @@ class OT2GymEnv(gym.Env):
         self.Z_MIN, self.Z_MAX = 0.1195, 0.2896
 
         self.margin = 0.02
+
         self.max_steps = int(max_steps)
         self.step_count = 0
-
         self.success_threshold = float(success_threshold)
         self.debug = bool(debug)
-
         self.action_repeat = max(1, int(action_repeat))
 
         self.rng = np.random.default_rng(seed)
@@ -147,13 +114,12 @@ class OT2GymEnv(gym.Env):
         if self.debug:
             print(
                 "ENV INIT:",
-                "success_threshold=", self.success_threshold,
-                "max_steps=", self.max_steps,
-                "action_repeat=", self.action_repeat,
-                "vel_max=", self.vel_max,
-                "near_goal_slowdown=", self.near_goal_slowdown,
-                "slowdown_radius=", self.slowdown_radius,
-                "slowdown_floor=", self.slowdown_floor,
+                "success_threshold=",
+                self.success_threshold,
+                "max_steps=",
+                self.max_steps,
+                "action_repeat=",
+                self.action_repeat,
             )
 
     # ---------------------------
@@ -229,69 +195,47 @@ class OT2GymEnv(gym.Env):
         action: np.ndarray,
     ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         self._set_cwd_for_assets()
+
         self.step_count += 1
 
         action = np.array(action, dtype=np.float32)
-        # Normalize + scale to velocity
-        a = np.clip(action[0:3], -1.0, 1.0)
-        vel = a * self.vel_max
-
-        # Slowdown near goal (compute based on CURRENT distance; no lag)
-        d_now = None
-        if self.near_goal_slowdown:
-            pip_now = self._get_pipette()
-            d_now = float(np.linalg.norm(self.target - pip_now))
-            if d_now < self.slowdown_radius:
-                scale = float(np.clip(d_now / self.slowdown_radius, self.slowdown_floor, 1.0))
-                vel *= scale
-
-        cmd = np.array([vel[0], vel[1], vel[2], 0.0], dtype=np.float32)
+        action[0:3] = np.clip(action[0:3], -0.3, 0.3)
+        action[3] = 0.0  # drop unused
 
         # Apply action for N sim steps (action repeat)
-        self.sim.run([cmd.tolist()], num_steps=self.action_repeat)
+        self.sim.run([action.tolist()], num_steps=self.action_repeat)
 
         obs = self._get_obs()
         pipette = obs[0:3]
         error_vec = self.target - pipette
         distance = float(np.linalg.norm(error_vec))
 
-        # -----------------------
-        # Reward shaping (stable + precision-focused)
-        # -----------------------
+        # Reward shaping
         progress = (self.prev_distance - distance) if self.prev_distance is not None else 0.0
 
-        # Dense improvement signal
-        reward = 5.0 * float(progress)
-
-        # Mild distance penalty (do NOT over-dominate returns)
-        reward -= 0.1 * distance
-
-        # Precision shaping: keep gradient strong as distance -> 0
-        eps = 1e-6
-        if self.prev_distance is not None:
-            reward += 0.5 * (np.log(self.prev_distance + eps) - np.log(distance + eps))
-
-        # Small effort + time cost
-        reward -= 0.001 * float(np.linalg.norm(vel))
-        reward -= float(self.time_penalty)
+        reward = 10.0 * float(progress)
+        reward -= 0.2 * distance
+        reward -= 0.01 * float(np.linalg.norm(action[0:3]))
 
         # Boundary penalty
         x, y, z = float(pipette[0]), float(pipette[1]), float(pipette[2])
         edge_margin = 0.01
         edge_pen = 0.0
+
         if x < self.X_MIN + edge_margin or x > self.X_MAX - edge_margin:
             edge_pen += 1.0
         if y < self.Y_MIN + edge_margin or y > self.Y_MAX - edge_margin:
             edge_pen += 1.0
         if z < self.Z_MIN + edge_margin or z > self.Z_MAX - edge_margin:
             edge_pen += 1.0
+
         reward -= 0.5 * edge_pen
 
         self.prev_distance = distance
 
         success = distance < self.success_threshold
         if success:
-            reward += 20.0
+            reward += 10.0
 
         terminated = success
         truncated = self.step_count >= self.max_steps
@@ -303,19 +247,20 @@ class OT2GymEnv(gym.Env):
             "is_success": success,
             "edge_pen": edge_pen,
             "action_repeat": self.action_repeat,
-            "vel_max": self.vel_max,
-            "near_goal_slowdown": self.near_goal_slowdown,
-            "d_now": d_now if d_now is not None else distance,
         }
 
         if self.debug and (self.step_count % 50 == 0 or success):
             print(
-                "DEBUG step", self.step_count,
-                "distance", distance,
-                "success", success,
-                "reward", float(reward),
-                "edge_pen", edge_pen,
-                "vel_norm", float(np.linalg.norm(vel)),
+                "DEBUG step",
+                self.step_count,
+                "distance",
+                distance,
+                "success",
+                success,
+                "reward",
+                reward,
+                "edge_pen",
+                edge_pen,
             )
 
         return obs, float(reward), terminated, truncated, info
@@ -327,8 +272,10 @@ class OT2GymEnv(gym.Env):
         """
         Critical: aggressively release PyBullet native memory.
 
-        Prevents long runs from crashing when Bullet clients are not disconnected.
+        This prevents long ClearML runs from crashing with std::bad_alloc / exit code 139
+        when Bullet clients are not disconnected cleanly.
         """
+        # 1) Try sim.close()
         try:
             if hasattr(self, "sim") and self.sim is not None:
                 try:
@@ -336,6 +283,7 @@ class OT2GymEnv(gym.Env):
                 except Exception:
                     pass
         finally:
+            # 2) Hard disconnect Bullet clients (safe if none exist)
             try:
                 if p is not None:
                     for cid in range(0, 32):
@@ -352,10 +300,11 @@ class OT2GymEnv(gym.Env):
             except Exception:
                 pass
 
-            try:
-                if getattr(self, "_old_cwd", None) is not None:
-                    os.chdir(self._old_cwd)
-            except Exception:
-                pass
+        # 3) Restore cwd
+        try:
+            if getattr(self, "_old_cwd", None) is not None:
+                os.chdir(self._old_cwd)
+        except Exception:
+            pass
 
-            self._cwd_set = False
+        self._cwd_set = False
