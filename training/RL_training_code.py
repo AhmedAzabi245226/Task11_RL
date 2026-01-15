@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-# ============================================================
-# ABSOLUTE TOP (stdlib only) — do not import SB3 / torch / envs
-# ============================================================
+"""
+Train a PPO reinforcement learning model locally or using ClearML workers.
+
+This script:
+- Can enqueue a job to ClearML or run locally.
+- Ensures worker dependencies are installed correctly.
+- Supports resuming from a ClearML artifact.
+- Saves checkpoints and optionally uploads them to ClearML.
+"""
+
 import os
 import sys
 import argparse
@@ -20,30 +27,31 @@ THIS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = THIS_DIR.parent
 
 
-# ============================================================
-# Helpers
-# ============================================================
 def _is_worker() -> bool:
+    """Return True if the script is running inside a ClearML worker environment."""
     return bool(os.environ.get("CLEARML_TASK_ID") or os.environ.get("CLEARML_WORKER_ID"))
 
 
 def _pip_install(cmd: list[str]) -> None:
+    """Run a pip command and stop the program if the install fails."""
     print("[pip]", " ".join(cmd))
     subprocess.check_call(cmd)
 
 
 def _restart_self() -> None:
+    """Restart the current Python process with the same command line arguments."""
     print("[restart] Restarting process ...")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def _cleanup_memory(tag: str = "") -> None:
+    """Try to free memory (Python GC and CUDA cache if torch is available)."""
     try:
         gc.collect()
     except Exception:
         pass
     try:
-        import torch  # noqa
+        import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception:
@@ -53,29 +61,25 @@ def _cleanup_memory(tag: str = "") -> None:
 
 
 def round_up_to_multiple(x: int, m: int) -> int:
+    """Round x up to the nearest multiple of m."""
     x = int(x)
     m = int(m)
     return int(((x + m - 1) // m) * m)
 
 
-# ============================================================
-# Args
-# ============================================================
 def parse_args():
+    """Read and return all command line arguments for training and ClearML options."""
     p = argparse.ArgumentParser()
 
-    # ClearML
     p.add_argument("--use_clearml", action="store_true", help="Enqueue training remotely via ClearML")
     p.add_argument("--project_name", type=str, default="Mentor Group - Alican/Group 1")
     p.add_argument("--task_name", type=str, default="OT2_PPO_Train")
     p.add_argument("--queue", type=str, default="default")
     p.add_argument("--docker", type=str, default="deanis/2023y2b-rl:latest")
 
-    # Run bookkeeping
     p.add_argument("--run_name", type=str, default="", help="models/<run_name>/...")
     p.add_argument("--seed", type=int, default=0)
 
-    # Env
     p.add_argument("--max_steps", type=int, default=400)
     p.add_argument("--success_threshold", type=float, default=0.03)
     p.add_argument("--action_repeat", type=int, default=1)
@@ -88,7 +92,6 @@ def parse_args():
     )
     p.add_argument("--render", action="store_true", help="GUI render (avoid on workers)")
 
-    # PPO hyperparameters
     p.add_argument("--learning_rate", type=float, default=3e-4)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--n_steps", type=int, default=512)
@@ -97,19 +100,15 @@ def parse_args():
     p.add_argument("--clip_range", type=float, default=0.2)
     p.add_argument("--ent_coef", type=float, default=0.0)
 
-    # Stabilizer for fine-tuning
     p.add_argument("--target_kl", type=float, default=None, help="Recommended 0.02 for fine-tuning stability")
 
-    # Timesteps & checkpointing
     p.add_argument("--total_timesteps", type=int, default=800_000)
     p.add_argument("--checkpoint_freq", type=int, default=102_400)
 
-    # Resume
     p.add_argument("--resume_task_id", type=str, default="", help="ClearML task id to resume from")
     p.add_argument("--resume_artifact", type=str, default="ppo_final_model", help="Artifact name")
     p.add_argument("--reset_timesteps", action="store_true", help="Reset SB3 timestep counter")
 
-    # Upload controls
     p.add_argument("--upload_checkpoints", action="store_true")
     p.add_argument("--upload_every_n_checkpoints", type=int, default=1)
     p.add_argument("--upload_final", action="store_true")
@@ -119,10 +118,8 @@ def parse_args():
     return p.parse_args()
 
 
-# ============================================================
-# ClearML setup (enqueue before heavy imports)
-# ============================================================
 def _get_task():
+    """Return the current ClearML task if available, otherwise return None."""
     try:
         from clearml import Task
         t = Task.current_task()
@@ -136,6 +133,7 @@ def _get_task():
 
 
 def clearml_setup_and_exit_if_local(args) -> Optional[str]:
+    """Set up ClearML and enqueue remotely when running locally, or attach when on a worker."""
     if not args.use_clearml and not _is_worker():
         return None
 
@@ -159,10 +157,8 @@ def clearml_setup_and_exit_if_local(args) -> Optional[str]:
     raise SystemExit(0)
 
 
-# ============================================================
-# Worker-only dependency enforcement
-# ============================================================
 def ensure_cpu_torch_on_worker() -> None:
+    """On a ClearML worker, ensure CPU-only torch is installed, then restart if changed."""
     if not _is_worker():
         return
 
@@ -193,12 +189,13 @@ def ensure_cpu_torch_on_worker() -> None:
 
 
 def ensure_pybullet_on_worker() -> None:
+    """On a ClearML worker, ensure pybullet is installed, then restart if changed."""
     if not _is_worker():
         return
 
     try:
-        import pybullet  # noqa
-        import pybullet_data  # noqa
+        import pybullet
+        import pybullet_data
         print("[pybullet-check] pybullet OK")
         return
     except Exception as e:
@@ -215,10 +212,8 @@ def ensure_pybullet_on_worker() -> None:
     _restart_self()
 
 
-# ============================================================
-# Resume helper
-# ============================================================
 def resolve_resume_local_path(args) -> str:
+    """If resume settings are provided, download the model artifact locally and return its path."""
     if not args.resume_task_id:
         return ""
     from clearml import Task
@@ -235,10 +230,8 @@ def resolve_resume_local_path(args) -> str:
     return local_path
 
 
-# ============================================================
-# Upload helper
-# ============================================================
 def upload_artifact(name: str, filepath: str) -> None:
+    """Upload a file to the current ClearML task as an artifact, if a task exists."""
     try:
         task = _get_task()
         if task is None:
@@ -260,10 +253,8 @@ def upload_artifact(name: str, filepath: str) -> None:
         print(f"[upload] FAILED {name}: {e}")
 
 
-# ============================================================
-# Main
-# ============================================================
 def main():
+    """Main entry point: set up environment, create/load model, train, save, and upload artifacts."""
     args = parse_args()
 
     os.chdir(str(PROJECT_ROOT))
@@ -275,7 +266,6 @@ def main():
     ensure_cpu_torch_on_worker()
     ensure_pybullet_on_worker()
 
-    # Heavy deps after fixes
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
@@ -284,7 +274,10 @@ def main():
     from envs.ot2_gym_wrapper import OT2GymEnv
 
     class ClearMLScalarCallback(BaseCallback):
+        """Report basic training scalars (timesteps, reward estimate, success rate) to ClearML."""
+
         def __init__(self, report_every_steps: int):
+            """Store reporting frequency and initialize tracking variables."""
             super().__init__()
             self.report_every_steps = int(report_every_steps)
             self._logger = None
@@ -294,6 +287,7 @@ def main():
             self._successes = 0
 
         def _on_training_start(self) -> None:
+            """Attach a ClearML logger (if available) when training starts."""
             try:
                 task = _get_task()
                 self._logger = task.get_logger() if task else None
@@ -303,6 +297,7 @@ def main():
                 print("[ClearML] scalar logger attach failed:", repr(e))
 
         def _on_step(self) -> bool:
+            """Collect per-step rewards and report summary values every N steps."""
             reward = float(self.locals["rewards"][0])
             done = bool(self.locals["dones"][0])
             info = self.locals["infos"][0] if self.locals.get("infos") else {}
@@ -342,9 +337,10 @@ def main():
     total = int(args.total_timesteps)
     chunk = int(args.checkpoint_freq) if int(args.checkpoint_freq) > 0 else total
 
-    # Avoid Monitor+VecMonitor double wrap
     def make_vec_env() -> VecMonitor:
+        """Create and return a vectorized OT2Gym environment wrapped with monitoring."""
         def _make():
+            """Create a single OT2Gym environment instance with the selected settings."""
             return OT2GymEnv(
                 render=args.render,
                 max_steps=args.max_steps,
@@ -358,6 +354,7 @@ def main():
         return VecMonitor(DummyVecEnv([_make]))
 
     def safe_close(vec_env) -> None:
+        """Safely close the environment and try to free memory."""
         try:
             if vec_env is not None:
                 vec_env.close()
@@ -367,7 +364,7 @@ def main():
 
     resume_local = resolve_resume_local_path(args)
 
-    print("\n========== TRAINING CONFIG ==========")
+    print("\nTRAINING CONFIG")
     print("Worker:", _is_worker())
     print("ClearML task id:", current_task_id if current_task_id else "(none)")
     print("Run name:", args.run_name)
@@ -392,7 +389,7 @@ def main():
     )
     print("Resume model:", resume_local if resume_local else "(none)")
     print("Save dir:", str(model_root))
-    print("====================================\n")
+    
 
     vec_env = make_vec_env()
 
@@ -400,11 +397,9 @@ def main():
         print("[resume] Loading PPO from:", resume_local)
         model = PPO.load(resume_local, env=vec_env, device="cpu")
 
-        # ---- CRITICAL: schedules must remain callables in SB3 ----
         model.learning_rate = get_schedule_fn(float(args.learning_rate))
         model.clip_range = get_schedule_fn(float(args.clip_range))
 
-        # Scalars are fine as floats
         model.ent_coef = float(args.ent_coef)
         model.n_epochs = int(args.n_epochs)
         model.batch_size = int(args.batch_size)
