@@ -4,18 +4,19 @@ ot2_gym_wrapper.py (Task 11 – RL Controller)
 Gymnasium-compatible environment wrapper for the Opentrons OT-2 PyBullet digital twin
 (Task 9 sim_class.py).
 
-Compatibility note (important for resuming SB3 models):
-- The action_space MUST stay identical across stages when you resume a PPO model.
-- Stage 3 used Box([-0.3,-0.3,-0.3,0],[0.3,0.3,0.3,1]).
-- Therefore: keep action_space fixed at +/-0.3, and apply vel_max as an INTERNAL scaling.
+Important note for resuming SB3 PPO models:
+- The action_space must NOT change when loading an old checkpoint.
+- Stage 3 used: Box([-0.3,-0.3,-0.3,0], [0.3,0.3,0.3,1])
+- Keep those limits fixed and scale internally using vel_max.
 
-Key design:
-- Action: [ax, ay, az, drop] where a* are in [-0.3, 0.3] (policy space, fixed)
-- Executed velocity = (a / 0.3) * vel_max  (env control space, stage-dependent)
-- Observation: pipette position, target position, error vector (9D)
+Design:
+- Action: [ax, ay, az, drop]
+  - ax, ay, az are always in [-0.3, 0.3] (fixed policy range)
+  - Executed velocity = (a / 0.3) * vel_max
+- Observation: pipette position (3) + target position (3) + error vector (3) = 9
 - Reward: progress + distance shaping + success bonus + action penalty + boundary penalty
-- Termination: success when distance < success_threshold
-- Truncation: max_steps
+- Done (terminated): distance < success_threshold
+- Truncated: max_steps reached
 """
 
 from __future__ import annotations
@@ -29,15 +30,14 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# IMPORTANT: pybullet is used ONLY for cleanup safety
+# Used only for safe disconnect/cleanup
 try:
     import pybullet as p  # type: ignore
 except Exception:
     p = None
 
-# -------------------------------------------------
+
 # Task 9 path setup
-# -------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # .../Task11_RL
 TASK9_PATH = (PROJECT_ROOT / "task09_robotics_environment").resolve()
 
@@ -60,7 +60,7 @@ from sim_class import Simulation  # noqa: E402
 class OT2GymEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
-    # IMPORTANT: keep this constant to resume old PPO checkpoints
+    # Fixed action bound (do not change if you want to resume older PPO models)
     ACTION_MAX = 0.3
 
     def __init__(
@@ -88,11 +88,10 @@ class OT2GymEnv(gym.Env):
         self.debug = bool(debug)
         self.action_repeat = max(1, int(action_repeat))
 
-        # This controls the REAL executed magnitude (mm-precision stages use smaller vel_max)
+        # vel_max controls the real speed (precision stages use smaller vel_max)
         self.vel_max = float(vel_max)
         self.near_goal_slowdown = bool(near_goal_slowdown)
 
-        # Action space MUST remain stable for resuming models
         a = self.ACTION_MAX
         self.action_space = spaces.Box(
             low=np.array([-a, -a, -a, 0.0], dtype=np.float32),
@@ -100,7 +99,7 @@ class OT2GymEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Observation: pipette_xyz (3) + target_xyz (3) + error_xyz (3) = 9
+        # Observation: pipette_xyz (3) + target_xyz (3) + error_xyz (3)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -108,11 +107,10 @@ class OT2GymEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Workspace boundaries from Task 9 (meters)
+        # Workspace boundaries (meters)
         self.X_MIN, self.X_MAX = -0.187, 0.253
         self.Y_MIN, self.Y_MAX = -0.1706, 0.2196
         self.Z_MIN, self.Z_MAX = 0.1195, 0.2896
-
         self.margin = 0.02
 
         self.rng = np.random.default_rng(seed)
@@ -130,15 +128,14 @@ class OT2GymEnv(gym.Env):
                 "slowdown=", self.near_goal_slowdown,
             )
 
-    # ---------------------------
-    # Helpers
-    # ---------------------------
     def _set_cwd_for_assets(self) -> None:
+        """Switches cwd to Task 9 so URDF/mesh paths resolve correctly."""
         if not self._cwd_set:
             os.chdir(str(TASK9_PATH))
             self._cwd_set = True
 
     def _sample_target(self) -> np.ndarray:
+        """Samples a safe random target inside the robot workspace."""
         x = self.rng.uniform(self.X_MIN + self.margin, self.X_MAX - self.margin)
         y = self.rng.uniform(self.Y_MIN + self.margin, self.Y_MAX - self.margin)
 
@@ -150,23 +147,23 @@ class OT2GymEnv(gym.Env):
         return np.array([x, y, z], dtype=np.float32)
 
     def _get_pipette(self) -> np.ndarray:
+        """Reads the current pipette XYZ from the simulator state."""
         states = self.sim.get_states()
         robot_state = next(iter(states.values()))
         return np.array(robot_state["pipette_position"], dtype=np.float32)
 
     def _get_obs(self) -> np.ndarray:
+        """Builds the 9D observation: pipette, target, and target error."""
         pipette = self._get_pipette()
         error = self.target - pipette
         return np.concatenate([pipette, self.target, error]).astype(np.float32)
 
-    # ---------------------------
-    # Gymnasium API
-    # ---------------------------
     def reset(
         self,
         seed: Optional[int] = None,
         options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Resets simulation and chooses a new target location."""
         super().reset(seed=seed)
         self._set_cwd_for_assets()
 
@@ -194,43 +191,41 @@ class OT2GymEnv(gym.Env):
         return obs, info
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        """
+        Runs one environment step:
+        - Clips the policy action to fixed bounds
+        - Scales it to a real velocity using vel_max
+        - Steps the simulator, then computes reward and done flags
+        """
         self._set_cwd_for_assets()
         self.step_count += 1
 
         action = np.array(action, dtype=np.float32)
 
-        # Policy action in fixed bounds (resume-safe)
         a = self.ACTION_MAX
         action[0:3] = np.clip(action[0:3], -a, a)
         action[3] = 0.0  # drop unused
 
-        # Map policy-space action -> executed velocity (stage-dependent)
-        # If vel_max=0.08, then action=0.3 becomes 0.08 velocity.
         vel = (action[0:3] / a) * self.vel_max
 
-        # Optional near-goal slowdown (helps precision)
         if self.near_goal_slowdown and (self.prev_distance is not None) and self.prev_distance < 0.02:
             scale = float(np.clip(self.prev_distance / 0.02, 0.15, 1.0))
             vel *= scale
 
         cmd = np.array([vel[0], vel[1], vel[2], 0.0], dtype=np.float32)
 
-        # Apply action for N sim steps
-        self.sim.run([cmd.tolist()], num_steps=self.action_repeat)
+        for _ in range(self.action_repeat):
+            self.sim.run([cmd.tolist()], num_steps=1)
 
         obs = self._get_obs()
         pipette = obs[0:3]
         distance = float(np.linalg.norm(self.target - pipette))
 
-        # Reward shaping
         progress = (self.prev_distance - distance) if self.prev_distance is not None else 0.0
         reward = 10.0 * float(progress)
         reward -= 0.2 * distance
-
-        # Penalize executed velocity magnitude (not raw action)
         reward -= 0.01 * float(np.linalg.norm(vel))
 
-        # Boundary penalty
         x, y, z = float(pipette[0]), float(pipette[1]), float(pipette[2])
         edge_margin = 0.01
         edge_pen = 0.0
@@ -265,9 +260,11 @@ class OT2GymEnv(gym.Env):
         return obs, float(reward), terminated, truncated, info
 
     def render(self):
+        """Rendering is handled by the simulator when render=True."""
         return None
 
     def close(self):
+        """Closes the simulator and safely disconnects any PyBullet connections."""
         try:
             if hasattr(self, "sim") and self.sim is not None:
                 try:

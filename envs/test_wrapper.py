@@ -1,17 +1,17 @@
 """
 test_wrapper.py (Task 11)
 
-Runs the OT2GymEnv for 1000 steps using random actions.
-This verifies the Gym wrapper works correctly (reset/step/termination).
+This script performs a simple smoke test for OT2GymEnv.
+It runs the environment for 1000 steps with random actions to confirm that:
+- reset() returns a valid observation + info dict
+- step() returns (obs, reward, terminated, truncated, info) in the correct format
+- episodes end correctly (terminated or truncated) and the env can be reset again
 """
 
 import os
 import sys
 
-
-# -------------------------------------------------
-# Ensure project root is on sys.path so "envs" imports work
-# -------------------------------------------------
+# Add the project root to sys.path so "envs" can be imported when running this file directly
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -23,7 +23,7 @@ TOTAL_STEPS = 1000
 
 
 def main():
-    # NOTE: render=False is safer for remote/server execution (no GUI needed)
+    # render=False avoids opening a GUI (safer on servers / remote machines)
     env = OT2GymEnv(render=False, max_steps=200, success_threshold=0.01, debug=False)
 
     obs, info = env.reset()
@@ -34,19 +34,23 @@ def main():
     successes = 0
 
     for step in range(TOTAL_STEPS):
+        # Random valid action from the environment action space
         action = env.action_space.sample()
+
+        # Take one step in the environment
         obs, reward, terminated, truncated, info = env.step(action)
 
-        # Print useful telemetry every 25 steps
+        # Print some values every 25 steps to confirm the env is updating normally
         if step % 25 == 0:
             target = info.get("target", None)
-            pip = info.get("pipette", None)
+            pipette = info.get("pipette", None)
             dist = info.get("distance", None)
             print(
                 f"step={step:04d} reward={reward:.4f} "
-                f"pip={pip} target={target} dist={dist}"
+                f"pipette={pipette} target={target} dist={dist}"
             )
 
+        # If the episode ends, count it and reset to start a new episode
         if terminated or truncated:
             episodes += 1
             if info.get("is_success", False):
@@ -54,7 +58,8 @@ def main():
 
             print(
                 f"Episode done at step {step} "
-                f"(terminated={terminated}, truncated={truncated}, success={info.get('is_success', False)})"
+                f"(terminated={terminated}, truncated={truncated}, "
+                f"success={info.get('is_success', False)})"
             )
 
             obs, info = env.reset()
