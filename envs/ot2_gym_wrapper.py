@@ -80,8 +80,7 @@ class OT2GymEnv(gym.Env):
         self._cwd_set = False
         self._set_cwd_for_assets()
 
-        self.sim = Simulation(num_agents=1, render=render, rgb_array=False)
-
+        self.sim = Simulation(num_agents=1, render=render, rgb_array=render)
         self.max_steps = int(max_steps)
         self.step_count = 0
         self.success_threshold = float(success_threshold)
